@@ -59,15 +59,20 @@ func (c *cluster) ticks(n int) {
 	}
 }
 
-// deliverAll drains every node's outbox and delivers each message to its
-// recipient (dropping messages to/from an isolated node), repeating until
-// no node has anything left to send — i.e. the cluster reaches a quiet
-// state for this round.
+// deliverAll drains every node's Ready() messages and delivers each to
+// its recipient (dropping messages to/from an isolated node), repeating
+// until no node has anything left to send — i.e. the cluster reaches a
+// quiet state for this round. Each node follows the real persist-then-
+// send-then-Advance contract: there's no real disk here (pure in-memory
+// tests don't need one), but calling Ready() then immediately Advance()
+// around each delivery exercises the API the same way a real caller
+// would, rather than taking a testing-only shortcut.
 func (c *cluster) deliverAll() {
 	for {
 		var any bool
 		for id, r := range c.nodes {
-			for _, m := range r.ReadMessages() {
+			rd := r.Ready()
+			for _, m := range rd.Messages {
 				any = true
 				if c.isolated[id] || c.isolated[m.To] {
 					continue // dropped: sender or recipient is partitioned away
@@ -78,6 +83,7 @@ func (c *cluster) deliverAll() {
 				}
 				recipient.Step(m)
 			}
+			r.Advance()
 		}
 		if !any {
 			return

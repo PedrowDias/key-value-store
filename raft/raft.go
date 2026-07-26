@@ -55,7 +55,53 @@ func (c Config) validate() error {
 	return nil
 }
 
-// Status is a read-only snapshot of a Raft node's current state, for
+// HardState is the subset of Raft's state that MUST be durable before any
+// message depending on it is allowed to leave this node: currentTerm and
+// votedFor. (The log entries themselves are the other piece that needs
+// persisting — tracked separately in Ready, since they're append-only
+// and typically much larger.)
+//
+// Concretely, the safety rule this exists to satisfy: granting a vote
+// must be on disk before the vote-granted response is sent, or a crash
+// between "decided to grant" and "wrote it down" followed by a restart
+// could grant the same term's vote to a second candidate — a genuine
+// safety violation, not just a liveness hiccup.
+type HardState struct {
+	Term uint64
+	Vote uint64
+}
+
+// Ready bundles everything that changed as a result of one or more
+// Tick()/Step() calls: state that must be durably persisted, and messages
+// that are safe to send only AFTER that persistence completes.
+//
+// The contract (matching etcd/raft's Ready/Advance convention): call
+// Ready(), persist HardState (if non-nil) and UnstableEntries to stable
+// storage — truncating any previously-persisted entries from
+// FirstUnstableIndex onward first, since a log conflict may have
+// invalidated them — THEN send Messages, THEN call Advance(). Doing any
+// step out of order (especially sending before persisting) reopens the
+// safety hole this whole mechanism exists to close.
+type Ready struct {
+	// HardState is non-nil only if Term or Vote changed since the last
+	// Advance() call.
+	HardState *HardState
+	// UnstableEntries are log entries from FirstUnstableIndex onward that
+	// aren't yet known to be durable. Empty if there's nothing new.
+	UnstableEntries []LogEntry
+	// FirstUnstableIndex is the index UnstableEntries starts at; only
+	// meaningful when UnstableEntries is non-empty. A previous
+	// Ready/Advance cycle may have reported (and the caller may have
+	// persisted) entries at or after this index that a subsequent log
+	// conflict has since invalidated — the caller must discard any
+	// persisted entries from this index onward before appending
+	// UnstableEntries.
+	FirstUnstableIndex uint64
+	// Messages are outbound messages, safe to send once the above is
+	// durable.
+	Messages []Message
+}
+
 // tests, observability, and callers deciding where to route a proposal.
 type Status struct {
 	ID           uint64
@@ -86,6 +132,17 @@ type Raft struct {
 
 	commitIndex uint64
 	lastApplied uint64
+
+	// Tracking for Ready()/Advance(): stableTerm/stableVote are the
+	// HardState values as of the last Advance() call; unstableIndex is
+	// the lowest log index not yet known to be durable. A log conflict
+	// (handleAppendEntries truncating a bad suffix) can only ever LOWER
+	// unstableIndex, never raise it — entries once reported as unstable
+	// stay considered unstable until an Advance() call confirms them
+	// persisted.
+	stableTerm    uint64
+	stableVote    uint64
+	unstableIndex uint64
 
 	// Leader-only volatile state (§5.3). Reset fresh on every transition
 	// into Leader; meaningless in any other role.
@@ -119,6 +176,7 @@ func New(cfg Config) (*Raft, error) {
 		peers:         append([]uint64(nil), cfg.Peers...),
 		role:          Follower,
 		log:           []LogEntry{{Term: 0, Index: 0}},
+		unstableIndex: 1,
 		electionTick:  cfg.ElectionTick,
 		heartbeatTick: cfg.HeartbeatTick,
 		rnd:           rand.New(rand.NewSource(int64(cfg.ID))),
@@ -127,7 +185,22 @@ func New(cfg Config) (*Raft, error) {
 	return r, nil
 }
 
-// Status returns a snapshot of the node's current state.
+// restoreState seeds a freshly constructed Raft with previously persisted
+// state, before it starts ticking or stepping — used by the persistent
+// storage layer on recovery. entries, if non-empty, must include the
+// index-0 dummy sentinel entry (Term 0, Index 0) as log[0], matching
+// New()'s own invariant.
+func (r *Raft) restoreState(hs HardState, entries []LogEntry) {
+	r.currentTerm = hs.Term
+	r.votedFor = hs.Vote
+	r.stableTerm = hs.Term
+	r.stableVote = hs.Vote
+	if len(entries) > 0 {
+		r.log = entries
+	}
+	r.unstableIndex = r.lastLogIndex() + 1
+}
+
 func (r *Raft) Status() Status {
 	return Status{
 		ID:           r.id,
@@ -139,13 +212,32 @@ func (r *Raft) Status() Status {
 	}
 }
 
-// ReadMessages drains and returns every outbound message queued since the
-// last call. The caller owns delivering these — over a real network in
-// production, or directly to other Raft instances in tests.
-func (r *Raft) ReadMessages() []Message {
-	msgs := r.msgs
+// Ready returns everything that changed since the last Advance() call —
+// see the Ready type's doc for the persist-then-send-then-Advance
+// contract this establishes. Safe to call repeatedly without side
+// effects; nothing is cleared until Advance().
+func (r *Raft) Ready() Ready {
+	rd := Ready{Messages: r.msgs}
+	if r.currentTerm != r.stableTerm || r.votedFor != r.stableVote {
+		rd.HardState = &HardState{Term: r.currentTerm, Vote: r.votedFor}
+	}
+	if r.lastLogIndex() >= r.unstableIndex {
+		rd.UnstableEntries = append([]LogEntry(nil), r.log[r.unstableIndex:]...)
+		rd.FirstUnstableIndex = r.unstableIndex
+	}
+	return rd
+}
+
+// Advance confirms that whatever the most recent Ready() call returned
+// has been durably persisted and its Messages sent, allowing Raft to stop
+// reporting them on subsequent Ready() calls.
+func (r *Raft) Advance() {
+	r.stableTerm = r.currentTerm
+	r.stableVote = r.votedFor
+	if r.lastLogIndex() >= r.unstableIndex {
+		r.unstableIndex = r.lastLogIndex() + 1
+	}
 	r.msgs = nil
-	return msgs
 }
 
 // Entries returns the entries in (start, end] — i.e. after index start up
@@ -381,6 +473,9 @@ func (r *Raft) handleAppendEntries(m Message) {
 				// history) and must be discarded before appending the
 				// leader's version.
 				r.log = r.log[:idx]
+				if idx < r.unstableIndex {
+					r.unstableIndex = idx
+				}
 			}
 			if idx > r.lastLogIndex() {
 				r.log = append(r.log, e)

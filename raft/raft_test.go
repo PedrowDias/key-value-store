@@ -4,7 +4,169 @@ import (
 	"testing"
 )
 
+// --- Ready/Advance contract ---------------------------------------------------
+
+func TestReady_HardStateNilWhenUnchanged(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2}, ElectionTick: 10, HeartbeatTick: 1})
+	r.Advance() // establish a baseline stable state
+	rd := r.Ready()
+	if rd.HardState != nil {
+		t.Fatalf("HardState = %+v, want nil (nothing changed since Advance)", rd.HardState)
+	}
+}
+
+func TestReady_HardStateReportedOnTermChange(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2}, ElectionTick: 10, HeartbeatTick: 1})
+	r.Advance()
+	r.becomeCandidate() // bumps currentTerm and sets votedFor
+
+	rd := r.Ready()
+	if rd.HardState == nil {
+		t.Fatal("expected a non-nil HardState after a term/vote change")
+	}
+	if rd.HardState.Term != r.currentTerm || rd.HardState.Vote != r.votedFor {
+		t.Fatalf("HardState = %+v, want Term=%d Vote=%d", rd.HardState, r.currentTerm, r.votedFor)
+	}
+}
+
+func TestReady_HardStateClearedAfterAdvance(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2}, ElectionTick: 10, HeartbeatTick: 1})
+	r.becomeCandidate()
+	r.Ready()
+	r.Advance()
+	rd := r.Ready()
+	if rd.HardState != nil {
+		t.Fatalf("HardState = %+v, want nil after Advance", rd.HardState)
+	}
+}
+
+func TestReady_UnstableEntriesReportedAndClearedAfterAdvance(t *testing.T) {
+	r, _ := New(Config{ID: 1, ElectionTick: 10, HeartbeatTick: 1})
+	r.role = Leader
+	r.Advance()
+
+	r.Propose([]byte("a"))
+	rd := r.Ready()
+	if len(rd.UnstableEntries) != 1 || string(rd.UnstableEntries[0].Data) != "a" {
+		t.Fatalf("UnstableEntries = %+v, want one entry with Data=a", rd.UnstableEntries)
+	}
+	if rd.FirstUnstableIndex != 1 {
+		t.Fatalf("FirstUnstableIndex = %d, want 1", rd.FirstUnstableIndex)
+	}
+	r.Advance()
+
+	rd = r.Ready()
+	if len(rd.UnstableEntries) != 0 {
+		t.Fatalf("UnstableEntries after Advance = %+v, want empty", rd.UnstableEntries)
+	}
+}
+
+func TestReady_NoUnstableEntriesWhenLogUnchanged(t *testing.T) {
+	r, _ := New(Config{ID: 1, ElectionTick: 10, HeartbeatTick: 1})
+	r.Advance()
+	rd := r.Ready()
+	if len(rd.UnstableEntries) != 0 || rd.FirstUnstableIndex != 0 {
+		t.Fatalf("Ready() on an untouched log = %+v, want empty", rd)
+	}
+}
+
+func TestReady_TruncationLowersFirstUnstableIndex(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2}, ElectionTick: 10, HeartbeatTick: 1})
+	// Simulate having already reported (and the caller having
+	// "persisted") two entries from an old, since-superseded leader.
+	r.log = append(r.log,
+		LogEntry{Term: 1, Index: 1, Data: []byte("stale-1")},
+		LogEntry{Term: 1, Index: 2, Data: []byte("stale-2")},
+	)
+	r.Advance() // marks both as stable, as if a caller had persisted them
+
+	// The real leader (higher term) now overwrites starting at index 2.
+	r.Step(Message{
+		Type: MsgAppendEntries, From: 2, To: 1, Term: 2,
+		PrevLogIndex: 1, PrevLogTerm: 1,
+		Entries: []LogEntry{{Term: 2, Index: 2, Data: []byte("real-2")}},
+	})
+
+	rd := r.Ready()
+	if rd.FirstUnstableIndex != 2 {
+		t.Fatalf("FirstUnstableIndex = %d, want 2 (the truncation point, even though it was previously marked stable)", rd.FirstUnstableIndex)
+	}
+	if len(rd.UnstableEntries) != 1 || string(rd.UnstableEntries[0].Data) != "real-2" {
+		t.Fatalf("UnstableEntries = %+v, want [{Data: real-2}]", rd.UnstableEntries)
+	}
+}
+
+func TestReady_MessagesAvailableUntilAdvance(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2}, ElectionTick: 10, HeartbeatTick: 1})
+	r.Advance()
+	r.becomeCandidate()
+
+	rd1 := r.Ready()
+	if len(rd1.Messages) == 0 {
+		t.Fatal("expected outbound RequestVote messages")
+	}
+	// Calling Ready() again without Advance() must return the same
+	// pending messages, not lose them.
+	rd2 := r.Ready()
+	if len(rd2.Messages) != len(rd1.Messages) {
+		t.Fatalf("second Ready() before Advance returned %d messages, want %d", len(rd2.Messages), len(rd1.Messages))
+	}
+	r.Advance()
+	rd3 := r.Ready()
+	if len(rd3.Messages) != 0 {
+		t.Fatalf("Ready() after Advance returned %d messages, want 0", len(rd3.Messages))
+	}
+}
+
+func TestRestoreState_SeedsRecoveredStateBeforeParticipating(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2, 3}, ElectionTick: 10, HeartbeatTick: 1})
+	recoveredLog := []LogEntry{
+		{Term: 0, Index: 0}, // dummy sentinel, as New() itself would have
+		{Term: 3, Index: 1, Data: []byte("recovered")},
+	}
+	r.restoreState(HardState{Term: 5, Vote: 2}, recoveredLog)
+
+	s := r.Status()
+	if s.Term != 5 {
+		t.Fatalf("Term = %d, want 5", s.Term)
+	}
+	if r.votedFor != 2 {
+		t.Fatalf("votedFor = %d, want 2", r.votedFor)
+	}
+	if s.LastLogIndex != 1 {
+		t.Fatalf("LastLogIndex = %d, want 1", s.LastLogIndex)
+	}
+	// Recovered state must be considered already-stable: a fresh Ready()
+	// must not try to re-report it as needing persistence.
+	rd := r.Ready()
+	if rd.HardState != nil {
+		t.Fatalf("HardState = %+v, want nil (recovered state is already stable)", rd.HardState)
+	}
+	if len(rd.UnstableEntries) != 0 {
+		t.Fatalf("UnstableEntries = %+v, want empty (recovered entries are already stable)", rd.UnstableEntries)
+	}
+}
+
+func TestRestoreState_EmptyEntriesKeepsDefaultLog(t *testing.T) {
+	r, _ := New(Config{ID: 1, ElectionTick: 10, HeartbeatTick: 1})
+	r.restoreState(HardState{Term: 2, Vote: 0}, nil)
+	if r.Status().LastLogIndex != 0 {
+		t.Fatalf("LastLogIndex = %d, want 0 (default dummy-sentinel-only log preserved)", r.Status().LastLogIndex)
+	}
+}
+
 // --- Config validation --------------------------------------------------------
+
+// readyMessages is a test-only convenience wrapping the real Ready/Advance
+// contract: call Ready(), grab its Messages, then Advance() to mark
+// everything in that Ready as durable — equivalent to the old
+// ReadMessages()'s drain-and-clear behavior, but going through the actual
+// API real callers use rather than a testing-only shortcut.
+func readyMessages(r *Raft) []Message {
+	rd := r.Ready()
+	r.Advance()
+	return rd.Messages
+}
 
 func TestNew_RejectsZeroID(t *testing.T) {
 	_, err := New(Config{ID: 0, ElectionTick: 10, HeartbeatTick: 1})
@@ -150,7 +312,7 @@ func TestVote_HigherTermCausesStepDown(t *testing.T) {
 func TestVote_WontVoteTwiceInSameTerm(t *testing.T) {
 	r, _ := New(Config{ID: 1, Peers: []uint64{2, 3}, ElectionTick: 10, HeartbeatTick: 1})
 	r.Step(Message{Type: MsgRequestVote, From: 2, To: 1, Term: 1, LastLogIndex: 0, LastLogTerm: 0})
-	msgs := r.ReadMessages()
+	msgs := readyMessages(r)
 	if len(msgs) != 1 || !msgs[0].VoteGranted {
 		t.Fatalf("expected the first vote request to be granted, got %+v", msgs)
 	}
@@ -158,7 +320,7 @@ func TestVote_WontVoteTwiceInSameTerm(t *testing.T) {
 	// A second candidate asks for a vote in the SAME term: must be denied
 	// since we already voted for node 2 this term.
 	r.Step(Message{Type: MsgRequestVote, From: 3, To: 1, Term: 1, LastLogIndex: 0, LastLogTerm: 0})
-	msgs = r.ReadMessages()
+	msgs = readyMessages(r)
 	if len(msgs) != 1 || msgs[0].VoteGranted {
 		t.Fatalf("expected the second vote request (same term) to be denied, got %+v", msgs)
 	}
@@ -167,12 +329,12 @@ func TestVote_WontVoteTwiceInSameTerm(t *testing.T) {
 func TestVote_WillVoteAgainInNewerTerm(t *testing.T) {
 	r, _ := New(Config{ID: 1, Peers: []uint64{2, 3}, ElectionTick: 10, HeartbeatTick: 1})
 	r.Step(Message{Type: MsgRequestVote, From: 2, To: 1, Term: 1, LastLogIndex: 0, LastLogTerm: 0})
-	r.ReadMessages()
+	readyMessages(r)
 
 	// A different candidate, but at a strictly higher term: must be
 	// allowed to vote again.
 	r.Step(Message{Type: MsgRequestVote, From: 3, To: 1, Term: 2, LastLogIndex: 0, LastLogTerm: 0})
-	msgs := r.ReadMessages()
+	msgs := readyMessages(r)
 	if len(msgs) != 1 || !msgs[0].VoteGranted {
 		t.Fatalf("expected a vote in a newer term to be granted, got %+v", msgs)
 	}
@@ -185,7 +347,7 @@ func TestVote_DeniedIfCandidateLogIsLessUpToDate(t *testing.T) {
 	r.log = append(r.log, LogEntry{Term: 5, Index: 1})
 
 	r.Step(Message{Type: MsgRequestVote, From: 2, To: 1, Term: 6, LastLogIndex: 0, LastLogTerm: 0})
-	msgs := r.ReadMessages()
+	msgs := readyMessages(r)
 	if len(msgs) != 1 || msgs[0].VoteGranted {
 		t.Fatalf("expected the vote to be denied for a less-up-to-date candidate log, got %+v", msgs)
 	}
@@ -196,7 +358,7 @@ func TestVote_GrantedIfCandidateLogIsAtLeastAsUpToDate(t *testing.T) {
 	r.log = append(r.log, LogEntry{Term: 5, Index: 1})
 
 	r.Step(Message{Type: MsgRequestVote, From: 2, To: 1, Term: 6, LastLogIndex: 1, LastLogTerm: 5})
-	msgs := r.ReadMessages()
+	msgs := readyMessages(r)
 	if len(msgs) != 1 || !msgs[0].VoteGranted {
 		t.Fatalf("expected the vote to be granted for an equally up-to-date candidate log, got %+v", msgs)
 	}
@@ -206,7 +368,7 @@ func TestVote_RequestAtLowerTermIsRejected(t *testing.T) {
 	r, _ := New(Config{ID: 1, Peers: []uint64{2}, ElectionTick: 10, HeartbeatTick: 1})
 	r.currentTerm = 5
 	r.Step(Message{Type: MsgRequestVote, From: 2, To: 1, Term: 3, LastLogIndex: 0, LastLogTerm: 0})
-	msgs := r.ReadMessages()
+	msgs := readyMessages(r)
 	if len(msgs) != 1 || msgs[0].VoteGranted || msgs[0].Term != 5 {
 		t.Fatalf("expected denial at our own (higher) term, got %+v", msgs)
 	}
@@ -315,7 +477,7 @@ func TestPropose_SingleNodeClusterCommitsImmediately(t *testing.T) {
 func TestStep_IgnoresMisaddressedMessage(t *testing.T) {
 	r, _ := New(Config{ID: 1, Peers: []uint64{2}, ElectionTick: 10, HeartbeatTick: 1})
 	r.Step(Message{Type: MsgRequestVote, From: 2, To: 99, Term: 1}) // To != our ID
-	if msgs := r.ReadMessages(); len(msgs) != 0 {
+	if msgs := readyMessages(r); len(msgs) != 0 {
 		t.Fatalf("expected a misaddressed message to be ignored, got %+v", msgs)
 	}
 }
@@ -385,7 +547,7 @@ func TestAppendEntries_LowerTermRejected(t *testing.T) {
 	r, _ := New(Config{ID: 1, Peers: []uint64{2}, ElectionTick: 10, HeartbeatTick: 1})
 	r.currentTerm = 5
 	r.Step(Message{Type: MsgAppendEntries, From: 2, To: 1, Term: 3})
-	msgs := r.ReadMessages()
+	msgs := readyMessages(r)
 	if len(msgs) != 1 || msgs[0].Success {
 		t.Fatalf("expected AppendEntries at a lower term to be rejected, got %+v", msgs)
 	}
@@ -524,7 +686,7 @@ func TestReplication_ConflictingEntriesAreTruncatedAndOverwritten(t *testing.T) 
 		LeaderCommit: 3,
 	})
 
-	msgs := r.ReadMessages()
+	msgs := readyMessages(r)
 	if len(msgs) != 1 || !msgs[0].Success {
 		t.Fatalf("expected AppendEntries to succeed, got %+v", msgs)
 	}
@@ -537,7 +699,7 @@ func TestReplication_ConflictingEntriesAreTruncatedAndOverwritten(t *testing.T) 
 func TestAppendEntries_PrevLogIndexBeyondOurLog(t *testing.T) {
 	r, _ := New(Config{ID: 1, Peers: []uint64{2}, ElectionTick: 10, HeartbeatTick: 1})
 	r.Step(Message{Type: MsgAppendEntries, From: 2, To: 1, Term: 1, PrevLogIndex: 5, PrevLogTerm: 1})
-	msgs := r.ReadMessages()
+	msgs := readyMessages(r)
 	if len(msgs) != 1 || msgs[0].Success {
 		t.Fatalf("expected failure when PrevLogIndex is beyond our log, got %+v", msgs)
 	}
@@ -547,7 +709,7 @@ func TestAppendEntries_PrevLogTermMismatch(t *testing.T) {
 	r, _ := New(Config{ID: 1, Peers: []uint64{2}, ElectionTick: 10, HeartbeatTick: 1})
 	r.log = append(r.log, LogEntry{Term: 1, Index: 1})
 	r.Step(Message{Type: MsgAppendEntries, From: 2, To: 1, Term: 2, PrevLogIndex: 1, PrevLogTerm: 99})
-	msgs := r.ReadMessages()
+	msgs := readyMessages(r)
 	if len(msgs) != 1 || msgs[0].Success {
 		t.Fatalf("expected failure on PrevLogTerm mismatch, got %+v", msgs)
 	}
