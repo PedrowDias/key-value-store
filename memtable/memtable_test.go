@@ -147,19 +147,20 @@ func TestIterator_ReflectsTombstonesAndValues(t *testing.T) {
 		key     string
 		val     string
 		deleted bool
+		seq     uint64
 	}
 	var got []ent
 	for it.Valid() {
-		got = append(got, ent{string(it.Key()), string(it.Value()), it.Deleted()})
+		got = append(got, ent{string(it.Key()), string(it.Value()), it.Deleted(), it.SeqNum()})
 		it.Next()
 	}
 
-	want := []ent{{"a", "va", false}, {"b", "", true}, {"c", "vc", false}}
+	want := []ent{{"a", "va", false, 1}, {"b", "", true, 2}, {"c", "vc", false, 3}}
 	if len(got) != len(want) {
 		t.Fatalf("got %+v, want %+v", got, want)
 	}
 	for i := range want {
-		if got[i].key != want[i].key || got[i].deleted != want[i].deleted {
+		if got[i].key != want[i].key || got[i].deleted != want[i].deleted || got[i].seq != want[i].seq {
 			t.Fatalf("entry %d: got %+v, want %+v", i, got[i], want[i])
 		}
 		if !want[i].deleted && got[i].val != want[i].val {

@@ -17,6 +17,7 @@ type Reader struct {
 	index      []indexEntry
 	bloom      *bloomFilter
 	numEntries int
+	maxSeq     uint64
 }
 
 // Open opens the SSTable at path, reading its footer, index, and bloom
@@ -49,7 +50,8 @@ func Open(path string) (*Reader, error) {
 	bloomOffset := binary.LittleEndian.Uint64(footer[16:24])
 	bloomLength := binary.LittleEndian.Uint64(footer[24:32])
 	numEntries := binary.LittleEndian.Uint64(footer[32:40])
-	magic := binary.LittleEndian.Uint64(footer[40:48])
+	maxSeq := binary.LittleEndian.Uint64(footer[40:48])
+	magic := binary.LittleEndian.Uint64(footer[48:56])
 	if magic != magicNumber {
 		f.Close()
 		return nil, fmt.Errorf("sstable: %s has bad magic number (not an sstable file, or corrupt)", path)
@@ -77,7 +79,7 @@ func Open(path string) (*Reader, error) {
 		return nil, fmt.Errorf("sstable: decoding index: %w", err)
 	}
 
-	return &Reader{f: f, index: index, bloom: bloom, numEntries: int(numEntries)}, nil
+	return &Reader{f: f, index: index, bloom: bloom, numEntries: int(numEntries), maxSeq: maxSeq}, nil
 }
 
 // readChecksummed reads a length-prefixed-by-the-caller block at the given
@@ -105,6 +107,14 @@ func (r *Reader) NumEntries() int {
 	return r.numEntries
 }
 
+// MaxSeq returns the highest WAL sequence number among this table's
+// entries. The engine uses this on restart to resume sequence-number
+// allocation past every value that's ever been durably assigned, across
+// both existing SSTables and the WAL.
+func (r *Reader) MaxSeq() uint64 {
+	return r.maxSeq
+}
+
 // Get looks up key. found is false if the key isn't in this table at all.
 // If found is true and deleted is true, this table holds a tombstone for
 // the key — the caller (the engine, consulting multiple SSTables newest
@@ -115,7 +125,7 @@ func (r *Reader) NumEntries() int {
 // answer, Get returns immediately without any disk I/O at all, which is
 // the entire point of shipping one per table.
 func (r *Reader) Get(key []byte) (value []byte, seq uint64, deleted bool, found bool, err error) {
-	if r.bloom != nil && !r.bloom.mayContain(key) {
+	if !r.bloom.mayContain(key) {
 		return nil, 0, false, false, nil
 	}
 

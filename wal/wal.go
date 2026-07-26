@@ -3,9 +3,22 @@ package wal
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 )
+
+// walFile is the subset of *os.File operations WAL needs. Defined as an
+// interface purely so tests can inject a fake that fails at a precise
+// point (a write, a Flush-triggered write, a Sync, a Close), the same
+// technique used in the sstable package's Writer — see its fileWriter
+// interface for the fuller rationale. A real *os.File satisfies this
+// as-is.
+type walFile interface {
+	io.Writer
+	Sync() error
+	Close() error
+}
 
 // WAL is an append-only log file. It is safe for concurrent use.
 //
@@ -19,7 +32,7 @@ import (
 // scenario Replay's torn-write handling is designed to tolerate.
 type WAL struct {
 	mu          sync.Mutex
-	file        *os.File
+	file        walFile
 	writer      *bufio.Writer
 	path        string
 	syncOnWrite bool

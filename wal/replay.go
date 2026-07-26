@@ -21,6 +21,17 @@ type RecoveryStats struct {
 	BytesTruncated int64
 }
 
+// replaySource is the subset of *os.File operations the core replay loop
+// needs. Defined as an interface purely so tests can inject a fake that
+// fails a Read or a Truncate at a precise point — both are otherwise
+// impractical to trigger deterministically against a real file (a mid-
+// stream read error needs a faulty disk or device; Truncate essentially
+// never fails on a normal writable file you already have open).
+type replaySource interface {
+	io.Reader
+	Truncate(size int64) error
+}
+
 // Replay reads every well-formed record from the WAL file at path, in the
 // order they were written, and returns them along with recovery stats.
 //
@@ -52,8 +63,13 @@ func Replay(path string) ([]Record, RecoveryStats, error) {
 	if err != nil {
 		return nil, RecoveryStats{}, fmt.Errorf("wal: stat: %w", err)
 	}
-	fileSize := info.Size()
 
+	return replayFrom(f, info.Size())
+}
+
+// replayFrom holds the actual replay loop, decoupled from file-opening so
+// it can be driven by a fake source in tests.
+func replayFrom(f replaySource, fileSize int64) ([]Record, RecoveryStats, error) {
 	var records []Record
 	var offset int64
 	header := make([]byte, headerSize)
@@ -115,7 +131,7 @@ func Replay(path string) ([]Record, RecoveryStats, error) {
 // the returned record set (already implicit, since we stop appending) and
 // from the on-disk file, so that future appends continue cleanly right
 // after the last valid record instead of leaving a corrupt gap.
-func truncateAndReturn(f *os.File, records []Record, validOffset, fileSize int64) ([]Record, RecoveryStats, error) {
+func truncateAndReturn(f replaySource, records []Record, validOffset, fileSize int64) ([]Record, RecoveryStats, error) {
 	truncated := fileSize - validOffset
 	if err := f.Truncate(validOffset); err != nil {
 		return nil, RecoveryStats{}, fmt.Errorf("wal: truncate torn tail: %w", err)

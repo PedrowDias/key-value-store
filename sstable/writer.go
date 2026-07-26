@@ -7,13 +7,13 @@
 //	[data block 0][data block 1]...[data block N]
 //	[bloom filter block]
 //	[index block]
-//	[footer, fixed 48 bytes at EOF]
+//	[footer, fixed 56 bytes at EOF]
 //
 // Every block (data, bloom, index) is followed by a 4-byte CRC32C
 // checksum over its own bytes, checked on every read. The footer is a
 // fixed-size trailer at the very end of the file recording where the
 // index and bloom blocks are, so opening a table means: seek to
-// (file size - 48), read the footer, then jump straight to the index —
+// (file size - 56), read the footer, then jump straight to the index —
 // no need to scan the file to find anything. This mirrors the
 // footer-at-EOF design LevelDB/RocksDB use for the same reason.
 package sstable
@@ -24,15 +24,31 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"os"
 )
 
 const (
 	defaultBlockSize = 4096
 	defaultBloomFPR  = 0.01
-	footerSize       = 48
+	footerSize       = 56
 	magicNumber      = 0x4B56535331 // arbitrary fixed constant identifying this file format/version
 )
+
+// fileWriter is the subset of *os.File operations Writer needs. Defined as
+// an interface (rather than using *os.File directly) purely so tests can
+// inject a fake that fails at a precise, chosen point — a write, a Sync,
+// or a Close — deterministically and portably. Simulating those same
+// failures against a real file would mean OS-specific tricks (permission
+// games root ignores, disk-full conditions, timing races) that are either
+// unreliable or don't work the same on Linux and macOS. A real *os.File
+// satisfies this interface as-is.
+type fileWriter interface {
+	io.Writer
+	Sync() error
+	Close() error
+	Name() string
+}
 
 // Options configures a Writer.
 type Options struct {
@@ -63,6 +79,7 @@ type Meta struct {
 	NumEntries int
 	MinKey     []byte
 	MaxKey     []byte
+	MaxSeq     uint64
 	FileSize   uint64
 }
 
@@ -71,7 +88,7 @@ type Meta struct {
 // compaction merge produces — since the writer streams entries straight
 // into blocks and never sorts or buffers the full data set.
 type Writer struct {
-	f    *os.File
+	f    fileWriter
 	w    *bufio.Writer
 	opts Options
 
@@ -87,6 +104,7 @@ type Writer struct {
 	minKey      []byte
 	maxKey      []byte
 	numEntries  int
+	maxSeq      uint64
 
 	closed bool
 }
@@ -134,6 +152,9 @@ func (w *Writer) Add(key, value []byte, seq uint64, deleted bool) error {
 	}
 	w.maxKey = keyCopy
 	w.numEntries++
+	if seq > w.maxSeq {
+		w.maxSeq = seq
+	}
 
 	if len(w.curBlock) >= w.opts.BlockSize {
 		return w.flushBlock()
@@ -162,18 +183,17 @@ func (w *Writer) flushBlock() error {
 }
 
 // writeChecksummed writes data followed by a 4-byte CRC32C trailer over
-// it, advancing w.offset, and returns the total bytes written (data + 4).
+// it in a single Write call, advancing w.offset, and returns the total
+// bytes written (data + 4).
 func (w *Writer) writeChecksummed(data []byte) (uint64, error) {
 	crc := crc32.Checksum(data, crcTable)
-	if _, err := w.w.Write(data); err != nil {
+	buf := make([]byte, len(data)+4)
+	copy(buf, data)
+	binary.LittleEndian.PutUint32(buf[len(data):], crc)
+	if _, err := w.w.Write(buf); err != nil {
 		return 0, fmt.Errorf("sstable: write: %w", err)
 	}
-	var trailer [4]byte
-	binary.LittleEndian.PutUint32(trailer[:], crc)
-	if _, err := w.w.Write(trailer[:]); err != nil {
-		return 0, fmt.Errorf("sstable: write checksum: %w", err)
-	}
-	length := uint64(len(data) + 4)
+	length := uint64(len(buf))
 	w.offset += length
 	return length, nil
 }
@@ -197,17 +217,21 @@ func (w *Writer) Finish() (*Meta, error) {
 	for _, k := range w.keys {
 		bf.add(k)
 	}
-	bloomOffset := w.offset
-	bloomLength, err := w.writeChecksummed(bf.encode())
-	if err != nil {
-		return nil, err
-	}
 
-	indexOffset := w.offset
-	indexLength, err := w.writeChecksummed(encodeIndex(w.index))
-	if err != nil {
-		return nil, err
+	// Bloom and index blocks share one write-and-checksum code path (and
+	// its error handling) rather than two near-identical copies.
+	blocks := [2][]byte{bf.encode(), encodeIndex(w.index)}
+	var blockOffsets, blockLengths [2]uint64
+	for i, data := range blocks {
+		blockOffsets[i] = w.offset
+		length, err := w.writeChecksummed(data)
+		if err != nil {
+			return nil, fmt.Errorf("sstable: writing block %d of 2 (0=bloom, 1=index): %w", i, err)
+		}
+		blockLengths[i] = length
 	}
+	bloomOffset, indexOffset := blockOffsets[0], blockOffsets[1]
+	bloomLength, indexLength := blockLengths[0], blockLengths[1]
 
 	footer := make([]byte, 0, footerSize)
 	footer = binary.LittleEndian.AppendUint64(footer, indexOffset)
@@ -215,10 +239,8 @@ func (w *Writer) Finish() (*Meta, error) {
 	footer = binary.LittleEndian.AppendUint64(footer, bloomOffset)
 	footer = binary.LittleEndian.AppendUint64(footer, bloomLength)
 	footer = binary.LittleEndian.AppendUint64(footer, uint64(w.numEntries))
+	footer = binary.LittleEndian.AppendUint64(footer, w.maxSeq)
 	footer = binary.LittleEndian.AppendUint64(footer, magicNumber)
-	if len(footer) != footerSize {
-		return nil, fmt.Errorf("sstable: internal error: footer is %d bytes, want %d", len(footer), footerSize)
-	}
 	if _, err := w.w.Write(footer); err != nil {
 		return nil, fmt.Errorf("sstable: write footer: %w", err)
 	}
@@ -242,6 +264,7 @@ func (w *Writer) Finish() (*Meta, error) {
 		NumEntries: w.numEntries,
 		MinKey:     w.minKey,
 		MaxKey:     w.maxKey,
+		MaxSeq:     w.maxSeq,
 		FileSize:   w.offset,
 	}, nil
 }
