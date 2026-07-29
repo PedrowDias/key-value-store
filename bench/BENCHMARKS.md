@@ -97,7 +97,16 @@ disk I/O. This is the number that matters for "how fast is the actual
 distributed system," as opposed to "how fast is the storage engine
 underneath it."
 
-### Baseline: no batching
+**A note on hardware for this section specifically**: the baseline,
+first-attempt, and fix-validation numbers below were all measured in the
+same sandboxed Linux container (not the Apple M3 the rest of this
+document uses) — kept consistent with each other so the *comparison*
+between them is a fair, same-hardware A/B test. Real M3 numbers for the
+post-fix state are reported separately, further down, since no
+pre-fix M3 baseline was ever measured — see that section for why the
+two shouldn't be directly multiplied against each other.
+
+### Baseline: no batching (sandbox)
 
 | Workload | Throughput | p50 | p99 |
 |---|---|---|---|
@@ -110,7 +119,7 @@ was already high. Writes were the bottleneck: every `Put`/`Delete`
 serialized through one leader doing an uncommitted `fsync` per operation,
 with zero batching anywhere in the write path.
 
-### First attempt: batching that didn't actually help
+### First attempt: batching that didn't actually help (sandbox)
 
 The first fix batched multiple concurrent client proposals into a single
 `raft.Node.Persist()` call (one WAL fsync for the leader's own log) and a
@@ -132,7 +141,7 @@ own response, one at a time, exactly as before. The leader's log-append
 batched; the actual network fan-out and follower-side work that
 determines whether an entry can commit did not.
 
-### The fix: `raft.ProposeBatch`
+### The fix: `raft.ProposeBatch` (sandbox validation)
 
 A new method, `ProposeBatch(datas [][]byte) ([]uint64, error)`, appends
 every entry in one call and defers sending until all of them are already
@@ -149,13 +158,56 @@ existing test are unaffected. `server.Server` was updated to call
 | Write-heavy (10% reads), 100 workers | ~1,110-2,270 ops/sec | ~17-77ms | ~130-200ms |
 
 Roughly a **4-5x throughput improvement** and **6-7x p50 latency
-improvement** over the original baseline, measured across 6 repeated
+improvement** over the sandbox baseline above, measured across 6 repeated
 runs each. Just as importantly: throughput with 100 concurrent workers is
 now comparable to (and often higher than) 20 workers, rather than
 plateauing at the same number regardless of load — confirming the fix
 addresses the actual bottleneck rather than just moving it.
 
+### Real hardware: Apple M3, post-fix
+
+The sandbox comparison above is same-hardware-both-sides, which is what
+makes it valid evidence the *fix* works — but sandbox `fsync` behavior
+(often backed by a container overlay filesystem, sometimes without the
+same physical durability guarantees or latency as a real disk) is not
+representative of real-world absolute performance. No pre-fix baseline
+was measured on real hardware, so the numbers below should be read as
+"real absolute performance, post-fix," not multiplied against the
+sandbox baseline to claim a specific speedup on this machine:
+
+| Workload | Throughput | p50 | p99 |
+|---|---|---|---|
+| Read-heavy (90% reads), 20 workers | 2,364.5 ops/sec | 467µs | 49.99ms |
+| Write-heavy (10% reads), 20 workers | 520.9 ops/sec | 36.96ms | 67.92ms |
+| Write-heavy (10% reads), 100 workers | 1,939.8 ops/sec | 44.56ms | 78.28ms |
+
+The genuinely interesting real-hardware finding: going from 20 to 100
+concurrent workers **nearly quadrupled** write throughput (521 → 1,940
+ops/sec) — a much sharper concurrency-scaling curve than the sandbox
+showed, where 20 and 100 workers gave roughly comparable throughput. The
+likely explanation: on a fast real SSD, each individual write completes
+quickly enough that 20 concurrent workers isn't consistently enough
+pressure to build large batches — `drainAndAcceptProposals` can only
+batch whatever's already queued in `proposeCh` at the exact moment it
+checks, so if requests complete (and workers send their next one) faster
+than they arrive, batches stay small. 100 workers generates enough
+concurrent pressure to reliably build larger batches even at this
+lower per-operation latency. This is a real, hardware-dependent property
+of the mechanism, not a discrepancy to explain away: the benefit of
+group commit scales with concurrent write pressure relative to
+per-operation latency, and both of those vary by hardware.
+
 ### Why this is worth documenting as a two-step process
+
+The first attempt at group commit was a reasonable, standard optimization
+that measurably didn't work as intended, and the reason wasn't obvious
+from reading the server-layer code in isolation — it required tracing
+the actual message flow down into `raft.Propose()`'s implementation to
+find. That's a realistic shape for real performance work: the first fix
+addresses a real inefficiency (redundant fsyncs) without addressing the
+actual bottleneck (network fan-out granularity), and confirming that with
+a flat-regardless-of-concurrency throughput number — rather than
+assuming success from a modest apparent improvement — is what caught it.
 
 The first attempt at group commit was a reasonable, standard optimization
 that measurably didn't work as intended, and the reason wasn't obvious

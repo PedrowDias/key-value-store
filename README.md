@@ -182,9 +182,9 @@ Full methodology and every number in
 |---|---|
 | Storage engine reads vs. a naive (but genuinely durable) baseline | up to **70x** faster |
 | Storage engine writes vs. the same baseline | **1.2-1.3x** faster (both durably `fsync`; this isolates filesystem overhead, not durability) |
-| Real cluster write throughput, before group commit | ~264-297 ops/sec |
-| Real cluster write throughput, after group commit | **~1,300-1,600 ops/sec** (~4-5x) |
-| Real cluster write p50 latency, before -> after | ~75ms -> **~12ms** |
+| Real cluster write throughput, sandbox before/after group commit | ~280 -> **~1,300-1,600 ops/sec** (~4-5x, same hardware both sides) |
+| Real cluster write p50 latency, sandbox before -> after | ~75ms -> **~12ms** |
+| Real cluster write throughput, Apple M3 (post-fix, no M3 baseline measured) | 521 ops/sec at 20 workers, **1,940 ops/sec** at 100 workers |
 | Leader failover time (kill -> new leader committing again) | **~700ms**, p99 ~704ms, across 10 trials |
 
 The naive baseline (`bench.NaiveStore`) is deliberately *not* a strawman:
