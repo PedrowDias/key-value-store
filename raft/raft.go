@@ -557,16 +557,49 @@ func (r *Raft) maybeAdvanceCommitIndex() {
 // until the entry commits — callers observe that via Status().CommitIndex
 // (or Entries, once it advances past the entry's index).
 func (r *Raft) Propose(data []byte) error {
+	_, err := r.ProposeBatch([][]byte{data})
+	return err
+}
+
+// ProposeBatch appends every element of datas as a new log entry, in
+// order, in a single call — then sends each peer exactly ONE
+// AppendEntries reflecting the complete new tail, rather than the N
+// separate messages N individual Propose() calls would generate.
+//
+// This is the reason ProposeBatch exists as its own method rather than
+// Propose just being called in a loop by a caller wanting to batch
+// several proposals: Propose's per-call sendAppendEntries means the
+// network fan-out (and therefore every follower's own append+persist+
+// response cycle) never actually batches even if the leader's own log
+// append does — calling Propose N times back-to-back still produces N
+// messages per peer, each redundantly carrying the growing tail. This
+// was discovered, not assumed: an earlier version of this project's
+// server package batched multiple client writes into back-to-back
+// Propose() calls expecting reduced fsync overhead throughout the
+// cluster, and measured almost no throughput improvement under
+// concurrent load — investigation traced it to exactly this eager
+// per-call send behavior. ProposeBatch defers sending until every entry
+// in the batch is already appended, so followers receive one message
+// carrying all of them.
+//
+// Returns the log index assigned to each element of datas, in the same
+// order, or ErrNotLeader (with no entries appended and no messages sent)
+// if this node isn't currently leader.
+func (r *Raft) ProposeBatch(datas [][]byte) ([]uint64, error) {
 	if r.role != Leader {
-		return ErrNotLeader
+		return nil, ErrNotLeader
 	}
-	entry := LogEntry{Term: r.currentTerm, Index: r.lastLogIndex() + 1, Data: data}
-	r.log = append(r.log, entry)
+	indices := make([]uint64, len(datas))
+	for i, data := range datas {
+		entry := LogEntry{Term: r.currentTerm, Index: r.lastLogIndex() + 1, Data: data}
+		r.log = append(r.log, entry)
+		indices[i] = entry.Index
+	}
 	for _, p := range r.peers {
 		r.sendAppendEntries(p)
 	}
 	if len(r.peers) == 0 {
 		r.maybeAdvanceCommitIndex()
 	}
-	return nil
+	return indices, nil
 }

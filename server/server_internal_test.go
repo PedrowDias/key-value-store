@@ -21,6 +21,14 @@ type fakeRaftNode struct {
 	persistErr   error
 	persistMsgs  []raft.Message
 	proposedData [][]byte
+	// autoCommit, if true, makes Propose immediately advance
+	// status.CommitIndex to match the newly proposed entry — simulating
+	// an instant single-node-style commit so a full Propose-through-
+	// Run()-through-applyCommitted round trip completes without needing
+	// a second message exchange to simulate. Off by default so existing
+	// tests that manipulate status/entries directly (bypassing the real
+	// Propose flow) are unaffected.
+	autoCommit bool
 }
 
 func newFakeRaftNode() *fakeRaftNode {
@@ -38,7 +46,33 @@ func (f *fakeRaftNode) Propose(data []byte) error {
 	f.proposedData = append(f.proposedData, data)
 	f.status.LastLogIndex++
 	f.entries[f.status.LastLogIndex] = raft.LogEntry{Term: f.status.Term, Index: f.status.LastLogIndex, Data: data}
+	if f.autoCommit {
+		f.status.CommitIndex = f.status.LastLogIndex
+	}
 	return nil
+}
+
+// ProposeBatch mirrors Propose for each element, returning the assigned
+// indices. The fake doesn't need to model ProposeBatch's real reason for
+// existing (sending one combined message instead of one per entry) —
+// that property is verified directly against the real raft.Raft in the
+// raft package's own tests; here, Server's tests only need consistent
+// index assignment and error/waiter bookkeeping.
+func (f *fakeRaftNode) ProposeBatch(datas [][]byte) ([]uint64, error) {
+	if f.proposeErr != nil {
+		return nil, f.proposeErr
+	}
+	indices := make([]uint64, len(datas))
+	for i, data := range datas {
+		f.proposedData = append(f.proposedData, data)
+		f.status.LastLogIndex++
+		f.entries[f.status.LastLogIndex] = raft.LogEntry{Term: f.status.Term, Index: f.status.LastLogIndex, Data: data}
+		indices[i] = f.status.LastLogIndex
+	}
+	if f.autoCommit {
+		f.status.CommitIndex = f.status.LastLogIndex
+	}
+	return indices, nil
 }
 
 func (f *fakeRaftNode) Entries(start, end uint64) []raft.LogEntry {
@@ -178,6 +212,119 @@ func TestApplyCommitted_SupersededProposalGetsError(t *testing.T) {
 	}
 }
 
+func TestApplyCommitted_MixedBatchAppliesGoodEntriesDespiteOneMalformed(t *testing.T) {
+	fake := newFakeRaftNode()
+	eng := newTestEngine(t)
+	srv := New(fake, newTestTransport(t), eng, time.Millisecond)
+
+	fake.entries[1] = raft.LogEntry{Term: 1, Index: 1, Data: encodeCommand(command{Type: cmdPut, Key: []byte("a"), Value: []byte("1")})}
+	fake.entries[2] = raft.LogEntry{Term: 1, Index: 2, Data: []byte{0xFF}} // malformed
+	fake.entries[3] = raft.LogEntry{Term: 1, Index: 3, Data: encodeCommand(command{Type: cmdPut, Key: []byte("c"), Value: []byte("3")})}
+	fake.status.CommitIndex = 3
+
+	waiter2 := make(chan applyResult, 1)
+	srv.waiters[2] = pendingPropose{data: []byte{0xFF}, resultCh: waiter2}
+
+	srv.applyCommitted()
+
+	// The two well-formed entries either side of the malformed one must
+	// still have been applied as part of the shared batch.
+	val, found, err := eng.Get([]byte("a"))
+	if err != nil || !found || string(val) != "1" {
+		t.Fatalf("Get(a) = %q found=%v err=%v", val, found, err)
+	}
+	val, found, err = eng.Get([]byte("c"))
+	if err != nil || !found || string(val) != "3" {
+		t.Fatalf("Get(c) = %q found=%v err=%v", val, found, err)
+	}
+	// The malformed entry's own waiter must still get its error.
+	select {
+	case res := <-waiter2:
+		if res.err == nil {
+			t.Fatal("expected an error for the malformed entry")
+		}
+	default:
+		t.Fatal("expected the malformed entry's waiter to be notified")
+	}
+	if srv.lastApplied != 3 {
+		t.Fatalf("lastApplied = %d, want 3 (must advance past the malformed entry too)", srv.lastApplied)
+	}
+}
+
+func TestApplyCommitted_WholeBatchFailureNotifiesWaiterWithError(t *testing.T) {
+	fake := newFakeRaftNode()
+	eng := newTestEngine(t)
+	srv := New(fake, newTestTransport(t), eng, time.Millisecond)
+
+	data := encodeCommand(command{Type: cmdPut, Key: []byte("k"), Value: []byte("v")})
+	fake.entries[1] = raft.LogEntry{Term: 1, Index: 1, Data: data}
+	fake.status.CommitIndex = 1
+
+	resultCh := make(chan applyResult, 1)
+	srv.waiters[1] = pendingPropose{data: data, resultCh: resultCh}
+
+	eng.Close() // forces the whole ApplyBatch call to fail
+
+	srv.applyCommitted()
+
+	select {
+	case res := <-resultCh:
+		if res.err == nil {
+			t.Fatal("expected an error when the whole batch fails to apply")
+		}
+	default:
+		t.Fatal("expected the waiter to be notified of the batch failure")
+	}
+}
+
+func TestApplyCommitted_NoOpWhenAlreadyUpToDate(t *testing.T) {
+	fake := newFakeRaftNode()
+	srv := New(fake, newTestTransport(t), newTestEngine(t), time.Millisecond)
+	// CommitIndex == lastApplied (both zero): nothing to do.
+	srv.applyCommitted()
+	if srv.lastApplied != 0 {
+		t.Fatalf("lastApplied = %d, want 0", srv.lastApplied)
+	}
+}
+
+// --- drainAndAcceptProposals (group commit batching) ------------------------
+
+func TestDrainAndAcceptProposals_BatchesAllWaitingRequests(t *testing.T) {
+	fake := newFakeRaftNode()
+	srv := New(fake, newTestTransport(t), newTestEngine(t), time.Millisecond)
+
+	// Pre-load two additional requests directly into the buffered
+	// channel (simulating concurrent callers already waiting), then
+	// call the drain method with a third as if Run() had just received
+	// it — deterministic, no goroutine-scheduling timing required.
+	req2 := proposeRequest{data: []byte("second"), resultCh: make(chan applyResult, 1)}
+	req3 := proposeRequest{data: []byte("third"), resultCh: make(chan applyResult, 1)}
+	srv.proposeCh <- req2
+	srv.proposeCh <- req3
+
+	req1 := proposeRequest{data: []byte("first"), resultCh: make(chan applyResult, 1)}
+	srv.drainAndAcceptProposals(req1)
+
+	if len(fake.proposedData) != 3 {
+		t.Fatalf("proposedData = %v, want 3 entries (all three requests batched together)", fake.proposedData)
+	}
+	if len(srv.waiters) != 3 {
+		t.Fatalf("waiters = %d, want 3", len(srv.waiters))
+	}
+}
+
+func TestDrainAndAcceptProposals_StopsWhenChannelEmpty(t *testing.T) {
+	fake := newFakeRaftNode()
+	srv := New(fake, newTestTransport(t), newTestEngine(t), time.Millisecond)
+
+	req := proposeRequest{data: []byte("only"), resultCh: make(chan applyResult, 1)}
+	srv.drainAndAcceptProposals(req)
+
+	if len(fake.proposedData) != 1 {
+		t.Fatalf("proposedData = %v, want exactly 1 (nothing else was waiting)", fake.proposedData)
+	}
+}
+
 // --- applyEntry's branches ---------------------------------------------------
 
 func TestApplyEntry_MalformedCommandReturnsError(t *testing.T) {
@@ -234,10 +381,23 @@ func TestApplyEntry_DeleteErrorPropagates(t *testing.T) {
 // --- propose()'s stopped-mid-flight branches --------------------------------
 
 func TestPropose_StoppedBeforeSubmission(t *testing.T) {
-	fake := newFakeRaftNode()
-	srv := New(fake, newTestTransport(t), newTestEngine(t), time.Hour) // huge tick interval: Run won't drain proposeCh on its own
-	go srv.Run()
-	srv.Stop() // closes doneCh before Run ever reads from proposeCh
+	// Constructed directly (bypassing New()) with an UNBUFFERED
+	// proposeCh specifically: with the real, buffered channel New()
+	// uses for production throughput, a send here would just succeed
+	// immediately into the buffer regardless of whether Run() is still
+	// reading, masking the exact branch this test targets (the first
+	// select's doneCh case, hit when the channel send itself can't
+	// proceed). An unbuffered channel restores that precise scenario.
+	srv := &Server{
+		node:      newFakeRaftNode(),
+		tr:        newTestTransport(t),
+		eng:       newTestEngine(t),
+		proposeCh: make(chan proposeRequest),
+		stopCh:    make(chan struct{}),
+		doneCh:    make(chan struct{}),
+		waiters:   make(map[uint64]pendingPropose),
+	}
+	close(srv.doneCh) // simulate Run having already exited
 
 	err := srv.propose([]byte("x"))
 	if err == nil {

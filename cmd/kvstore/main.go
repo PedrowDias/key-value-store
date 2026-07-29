@@ -1,3 +1,7 @@
+// Command kvstore runs one node of the distributed key-value store: it
+// wires together the storage engine, Raft consensus, and TCP transport
+// (via the server package) and exposes an HTTP API for clients. See the
+// repository's root README for how to start a cluster.
 package main
 
 import (
@@ -223,7 +227,7 @@ func runServer(cfg config, httpListener net.Listener, stopCh <-chan os.Signal, r
 	srv := server.New(raftNode, tr, eng, cfg.tickInterval)
 	go srv.Run()
 
-	httpSrv, httpErrCh := startHTTPServer(httpListener, newAPI(srv).routes())
+	httpSrv, httpErrCh := startHTTPServer(httpListener, server.NewHTTPAPI(srv).Handler())
 
 	log.Printf("kvstore: node %d serving HTTP on %s, Raft on %s", cfg.id, httpListener.Addr().String(), tr.Addr())
 	if ready != nil {

@@ -39,6 +39,12 @@ func (n *Node) Step(m Message) { n.r.Step(m) }
 // leader.
 func (n *Node) Propose(data []byte) error { return n.r.Propose(data) }
 
+// ProposeBatch appends multiple entries in one call, sending each peer a
+// single AppendEntries covering all of them rather than one message per
+// entry. See Raft.ProposeBatch's doc for why this matters beyond just
+// convenience.
+func (n *Node) ProposeBatch(datas [][]byte) ([]uint64, error) { return n.r.ProposeBatch(datas) }
+
 // Status returns a snapshot of the node's current state.
 func (n *Node) Status() Status { return n.r.Status() }
 

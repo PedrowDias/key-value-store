@@ -3,6 +3,18 @@
 // durably recorded here before it is applied to the in-memory memtable,
 // so that if the process crashes, the memtable can be reconstructed by
 // replaying the log.
+//
+// Each record is framed independently:
+//
+//	[4B CRC32C(payload)] [4B payload length] [payload...]
+//
+//	payload:
+//	  [1B type] [8B seq num] [4B key len] [key] [4B value len] [value]
+//
+// This mirrors LevelDB/RocksDB WAL framing: a per-record length + checksum
+// means a crash mid-write leaves, at worst, one trailing corrupt or
+// truncated record — detectable and safely discardable on replay,
+// without corrupting anything written before it.
 package wal
 
 import (

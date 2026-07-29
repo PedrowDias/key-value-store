@@ -435,6 +435,112 @@ func TestGet_PropagatesSSTableReadError(t *testing.T) {
 
 // --- WAL/SSTable wiring sanity checks (using the real wal package types) ----
 
+// --- ApplyBatch (group commit) -----------------------------------------------
+
+func TestApplyBatch_EmptyBatchIsNoop(t *testing.T) {
+	e := mustOpen(t, Options{Dir: tempDir(t)})
+	defer e.Close()
+	if err := e.ApplyBatch(nil); err != nil {
+		t.Fatalf("ApplyBatch(nil) should be a no-op, got: %v", err)
+	}
+	if err := e.ApplyBatch([]BatchOp{}); err != nil {
+		t.Fatalf("ApplyBatch([]BatchOp{}) should be a no-op, got: %v", err)
+	}
+}
+
+func TestApplyBatch_MixedPutAndDeleteAppliedInOrder(t *testing.T) {
+	e := mustOpen(t, Options{Dir: tempDir(t)})
+	defer e.Close()
+
+	// Put a, put b, then within the SAME batch: overwrite a, delete b,
+	// put c. Order within the batch must be preserved, matching what N
+	// individual sequential calls would have produced.
+	if err := e.Put([]byte("a"), []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Put([]byte("b"), []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+
+	err := e.ApplyBatch([]BatchOp{
+		{Key: []byte("a"), Value: []byte("v2")},
+		{Key: []byte("b"), Deleted: true},
+		{Key: []byte("c"), Value: []byte("v1")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	val, found, err := e.Get([]byte("a"))
+	if err != nil || !found || string(val) != "v2" {
+		t.Fatalf("Get(a) = %q found=%v err=%v, want v2 true nil", val, found, err)
+	}
+	_, found, err = e.Get([]byte("b"))
+	if err != nil || found {
+		t.Fatalf("Get(b) found=%v err=%v, want false nil (deleted)", found, err)
+	}
+	val, found, err = e.Get([]byte("c"))
+	if err != nil || !found || string(val) != "v1" {
+		t.Fatalf("Get(c) = %q found=%v err=%v, want v1 true nil", val, found, err)
+	}
+}
+
+func TestApplyBatch_TriggersAutoFlushOnce(t *testing.T) {
+	e := mustOpen(t, Options{Dir: tempDir(t), MemtableSizeThreshold: 100})
+	defer e.Close()
+
+	ops := make([]BatchOp, 20)
+	for i := range ops {
+		ops[i] = BatchOp{Key: []byte(fmt.Sprintf("k%03d", i)), Value: []byte("some-reasonably-sized-value-for-this-test")}
+	}
+	if err := e.ApplyBatch(ops); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := e.Stats().NumSSTables; got == 0 {
+		t.Fatal("expected the batch to have crossed the tiny threshold and triggered a flush")
+	}
+	// Everything in the batch must still be readable regardless of
+	// which side of the flush it landed on.
+	for _, op := range ops {
+		val, found, err := e.Get(op.Key)
+		if err != nil || !found || string(val) != string(op.Value) {
+			t.Fatalf("Get(%s) = %q found=%v err=%v", op.Key, val, found, err)
+		}
+	}
+}
+
+func TestApplyBatch_SequenceNumbersAreDistinctAndIncreasing(t *testing.T) {
+	e := mustOpen(t, Options{Dir: tempDir(t)})
+	defer e.Close()
+
+	if err := e.ApplyBatch([]BatchOp{
+		{Key: []byte("a"), Value: []byte("1")},
+		{Key: []byte("b"), Value: []byte("2")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// A subsequent single Put must get a seq number after both batch
+	// entries, not colliding with either.
+	if err := e.Put([]byte("c"), []byte("3")); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"a", "b", "c"} {
+		if _, found, err := e.Get([]byte(k)); err != nil || !found {
+			t.Fatalf("Get(%s): found=%v err=%v", k, found, err)
+		}
+	}
+}
+
+func TestApplyBatch_OnClosedEngineErrors(t *testing.T) {
+	e := mustOpen(t, Options{Dir: tempDir(t)})
+	e.Close()
+	err := e.ApplyBatch([]BatchOp{{Key: []byte("k"), Value: []byte("v")}})
+	if err == nil {
+		t.Fatal("expected an error applying a batch to a closed engine")
+	}
+}
+
 func TestEngine_DeleteRecordTypeUsedCorrectly(t *testing.T) {
 	// Sanity check that write() picks wal.RecordDelete vs wal.RecordPut
 	// correctly by inspecting what actually lands in the WAL via Replay.

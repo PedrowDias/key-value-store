@@ -56,6 +56,7 @@ type raftNode interface {
 	Tick()
 	Step(m raft.Message)
 	Propose(data []byte) error
+	ProposeBatch(datas [][]byte) ([]uint64, error)
 	Status() raft.Status
 	Entries(start, end uint64) []raft.LogEntry
 	Persist() ([]raft.Message, error)
@@ -101,6 +102,16 @@ type Server struct {
 	cachedStatus raft.Status
 }
 
+// proposeChBufferSize bounds how many pending Put/Delete calls can be
+// queued waiting for Run() to pick them up. A buffer (rather than an
+// unbuffered channel) is what makes batching in Run()'s propose case
+// actually effective under concurrent load: with no buffer, only a
+// proposal that happens to already be blocked mid-send at the exact
+// moment Run() checks would ever be found by the non-blocking drain: a
+// buffer lets many concurrent callers' proposals actually accumulate
+// while Run() is busy with the previous batch's Persist()/pump() cycle.
+const proposeChBufferSize = 256
+
 // New constructs a Server. tr and eng are assumed already open; Server
 // takes ownership of ticking/driving node but does NOT close tr or eng
 // itself (the caller opened them and should close them, typically after
@@ -111,7 +122,7 @@ func New(node raftNode, tr *transport.Transport, eng *engine.Engine, tickInterva
 		tr:           tr,
 		eng:          eng,
 		tickInterval: tickInterval,
-		proposeCh:    make(chan proposeRequest),
+		proposeCh:    make(chan proposeRequest, proposeChBufferSize),
 		stopCh:       make(chan struct{}),
 		doneCh:       make(chan struct{}),
 		waiters:      make(map[uint64]pendingPropose),
@@ -140,17 +151,67 @@ func (s *Server) Run() {
 			s.pump()
 
 		case req := <-s.proposeCh:
-			if err := s.node.Propose(req.data); err != nil {
-				req.resultCh <- applyResult{err: err}
-				continue
-			}
-			idx := s.node.Status().LastLogIndex
-			s.waiters[idx] = pendingPropose{data: req.data, resultCh: req.resultCh}
+			// Group commit: opportunistically drain every OTHER
+			// proposal already waiting in the channel right now, so
+			// all of them share the single Persist() (and therefore
+			// single WAL fsync) call this iteration makes, instead of
+			// each paying for its own. Under concurrent write load this
+			// is the single highest-leverage change for throughput —
+			// fsync latency, not CPU, is the bottleneck, and batching
+			// amortizes it across every proposal in the group.
+			s.drainAndAcceptProposals(req)
 			s.pump()
 
 		case <-s.stopCh:
 			return
 		}
+	}
+}
+
+// drainAndAcceptProposals accepts req (already received from proposeCh)
+// plus every other proposeRequest immediately available in the channel
+// right now, without blocking for more, and submits all of them via a
+// SINGLE ProposeBatch call — the other half of this project's group
+// commit optimization, alongside applyCommitted's batched ApplyBatch
+// call. Using ProposeBatch here (rather than calling Propose in a loop)
+// is what actually matters: Propose sends AppendEntries eagerly on every
+// call, so a loop of N Propose calls still produces N separate messages
+// to every follower — each triggering its own follower-side append,
+// persist, and response — even though the LEADER's own log append and
+// eventual WAL persist would batch just fine. ProposeBatch defers
+// sending until every entry in the group is already appended, so
+// followers receive one message carrying all of them.
+//
+// Split out from Run's select loop as its own method specifically so
+// it's directly testable: a test can pre-load several requests into the
+// (buffered) channel and call this once, deterministically confirming
+// all of them get accepted together, rather than relying on real
+// goroutine-scheduling timing to occasionally win the race.
+func (s *Server) drainAndAcceptProposals(req proposeRequest) {
+	reqs := []proposeRequest{req}
+drainLoop:
+	for {
+		select {
+		case req2 := <-s.proposeCh:
+			reqs = append(reqs, req2)
+		default:
+			break drainLoop
+		}
+	}
+
+	datas := make([][]byte, len(reqs))
+	for i, r := range reqs {
+		datas[i] = r.data
+	}
+	indices, err := s.node.ProposeBatch(datas)
+	if err != nil {
+		for _, r := range reqs {
+			r.resultCh <- applyResult{err: err}
+		}
+		return
+	}
+	for i, r := range reqs {
+		s.waiters[indices[i]] = pendingPropose{data: r.data, resultCh: r.resultCh}
 	}
 }
 
@@ -201,24 +262,63 @@ func (s *Server) refreshCachedStatus() {
 }
 
 // applyCommitted applies every entry between lastApplied and the
-// current CommitIndex, in order, to the local engine — the actual
-// "replicated state machine" step. Runs unconditionally regardless of
-// this node's role: every node applies every committed entry, which is
-// what keeps them all converging on the same state.
+// current CommitIndex to the local engine — the actual "replicated
+// state machine" step. Runs unconditionally regardless of this node's
+// role: every node applies every committed entry, which is what keeps
+// them all converging on the same state.
+//
+// Every newly committed entry in this call is applied via ONE
+// engine.ApplyBatch call (one WAL fsync) rather than one Put/Delete call
+// (one fsync each) per entry — the other half of this project's group
+// commit optimization, complementing Run()'s proposeCh draining: batching
+// doesn't help if entries still get committed and applied one at a time
+// once they reach this stage.
 func (s *Server) applyCommitted() {
 	status := s.node.Status()
-	for s.lastApplied < status.CommitIndex {
-		nextIndex := s.lastApplied + 1
-		entries := s.node.Entries(s.lastApplied, nextIndex)
-		if len(entries) == 0 {
-			// Shouldn't happen (CommitIndex implies the entry exists),
-			// but don't spin forever if it somehow does.
-			return
-		}
-		entry := entries[0]
-		s.lastApplied = nextIndex
+	if s.lastApplied >= status.CommitIndex {
+		return
+	}
+	entries := s.node.Entries(s.lastApplied, status.CommitIndex)
+	if len(entries) == 0 {
+		// Shouldn't happen (CommitIndex implies these entries exist),
+		// but don't spin forever if it somehow does.
+		return
+	}
 
-		res := s.applyEntry(entry)
+	// Decode every entry up front, classifying each as either a valid
+	// op (to include in the shared batch) or a standalone error (a
+	// malformed/unknown command, which — being essentially impossible
+	// in practice since a proposer's own command was correctly encoded —
+	// is handled as an isolated per-entry failure rather than aborting
+	// the whole batch over one already-anomalous entry).
+	cmds := make([]command, len(entries))
+	decodeErrs := make([]error, len(entries))
+	var ops []engine.BatchOp
+	for i, entry := range entries {
+		cmd, err := decodeAndValidateCommand(entry)
+		if err != nil {
+			decodeErrs[i] = err
+			continue
+		}
+		cmds[i] = cmd
+		ops = append(ops, engine.BatchOp{Key: cmd.Key, Value: cmd.Value, Deleted: cmd.Type == cmdDelete})
+	}
+
+	var batchErr error
+	if len(ops) > 0 {
+		batchErr = s.eng.ApplyBatch(ops)
+	}
+
+	for i, entry := range entries {
+		s.lastApplied = entry.Index
+
+		var res applyResult
+		switch {
+		case decodeErrs[i] != nil:
+			res = applyResult{err: decodeErrs[i]}
+		case batchErr != nil:
+			res = applyResult{err: fmt.Errorf("server: applying entry %d: %w", entry.Index, batchErr)}
+		}
 
 		if p, ok := s.waiters[entry.Index]; ok {
 			delete(s.waiters, entry.Index)
@@ -237,11 +337,31 @@ func (s *Server) applyCommitted() {
 	}
 }
 
-// applyEntry decodes and applies one committed entry to the engine.
-func (s *Server) applyEntry(entry raft.LogEntry) applyResult {
+// decodeAndValidateCommand decodes entry.Data and confirms it's a known
+// command type, returning a descriptive error otherwise. Shared by
+// applyCommitted's batch path and applyEntry (kept standalone for
+// existing per-entry tests and any caller wanting to apply a single
+// entry directly, outside the batched Run() path).
+func decodeAndValidateCommand(entry raft.LogEntry) (command, error) {
 	cmd, err := decodeCommand(entry.Data)
 	if err != nil {
-		return applyResult{err: fmt.Errorf("server: decoding committed entry %d: %w", entry.Index, err)}
+		return command{}, fmt.Errorf("server: decoding committed entry %d: %w", entry.Index, err)
+	}
+	if cmd.Type != cmdPut && cmd.Type != cmdDelete {
+		return command{}, fmt.Errorf("server: unknown command type %d in entry %d", cmd.Type, entry.Index)
+	}
+	return cmd, nil
+}
+
+// applyEntry decodes and applies a single committed entry to the engine.
+// Not used by applyCommitted's batched path (see decodeAndValidateCommand
+// and the ApplyBatch call above) — kept as a standalone single-entry
+// operation for tests and any future caller that needs to apply exactly
+// one entry without going through the batching machinery.
+func (s *Server) applyEntry(entry raft.LogEntry) applyResult {
+	cmd, err := decodeAndValidateCommand(entry)
+	if err != nil {
+		return applyResult{err: err}
 	}
 	switch cmd.Type {
 	case cmdPut:
@@ -252,8 +372,6 @@ func (s *Server) applyEntry(entry raft.LogEntry) applyResult {
 		if err := s.eng.Delete(cmd.Key); err != nil {
 			return applyResult{err: fmt.Errorf("server: applying delete for entry %d: %w", entry.Index, err)}
 		}
-	default:
-		return applyResult{err: fmt.Errorf("server: unknown command type %d in entry %d", cmd.Type, entry.Index)}
 	}
 	return applyResult{}
 }

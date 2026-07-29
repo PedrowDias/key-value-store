@@ -86,3 +86,83 @@ range) suggests the remaining two nodes' randomized election timeouts
 almost every time, without the "dueling candidates" disruption `raft`'s
 own README documents as a known vanilla-Raft characteristic.
 
+## Cluster-level throughput and latency (real TCP + real HTTP, 3-node cluster)
+
+Unlike the storage-engine benchmarks above (in-process, direct calls to
+`engine.Engine`), `TestClusterThroughputAndLatency` in
+`cluster_load_test.go` drives a real 3-node cluster over real TCP (Raft)
+and real HTTP (client API) with many concurrent clients, measuring true
+end-to-end latency: network + Raft consensus + storage, not just local
+disk I/O. This is the number that matters for "how fast is the actual
+distributed system," as opposed to "how fast is the storage engine
+underneath it."
+
+### Baseline: no batching
+
+| Workload | Throughput | p50 | p99 |
+|---|---|---|---|
+| Read-heavy (90% reads) | ~2,100-2,300 ops/sec | <1ms | ~50ms |
+| Write-heavy (10% reads) | ~264-297 ops/sec | ~72-76ms | ~90-220ms |
+
+Reads never touch Raft at all (`Get` is local-only — see `server`'s
+README on the linearizability tradeoff this implies), so read throughput
+was already high. Writes were the bottleneck: every `Put`/`Delete`
+serialized through one leader doing an uncommitted `fsync` per operation,
+with zero batching anywhere in the write path.
+
+### First attempt: batching that didn't actually help
+
+The first fix batched multiple concurrent client proposals into a single
+`raft.Node.Persist()` call (one WAL fsync for the leader's own log) and a
+single `engine.ApplyBatch()` call (one WAL fsync for applying committed
+entries) — the standard "group commit" pattern. Measuring it directly
+against the baseline: throughput moved to only **~330-350 ops/sec**,
+barely better, and — more tellingly — **it stayed at almost exactly that
+number regardless of whether 20 or 100 concurrent workers generated the
+load**. A flat throughput ceiling independent of concurrency is the
+signature of an un-batched serial bottleneck still being hit somewhere.
+
+Investigating why led to the real cause: `raft.Raft.Propose()` sends
+`AppendEntries` to every peer **eagerly, on every single call**. Batching
+client requests at the server layer into back-to-back `Propose()` calls
+batched the *leader's own* WAL persistence, but each `Propose()` call
+still sent its own separate network message to every follower — meaning
+each follower still did its own append, its own WAL persist, and sent its
+own response, one at a time, exactly as before. The leader's log-append
+batched; the actual network fan-out and follower-side work that
+determines whether an entry can commit did not.
+
+### The fix: `raft.ProposeBatch`
+
+A new method, `ProposeBatch(datas [][]byte) ([]uint64, error)`, appends
+every entry in one call and defers sending until all of them are already
+in the log — so each peer receives **one** `AppendEntries` carrying all
+the batched entries, instead of one message per entry.
+`Propose(data []byte) error` is now a thin wrapper
+(`ProposeBatch([][]byte{data})`), so its existing behavior and every
+existing test are unaffected. `server.Server` was updated to call
+`ProposeBatch` once per drain cycle instead of looping `Propose`.
+
+| Workload | Throughput | p50 | p99 |
+|---|---|---|---|
+| Write-heavy (10% reads), 20 workers | ~1,090-1,610 ops/sec | ~11-13ms | ~40-55ms |
+| Write-heavy (10% reads), 100 workers | ~1,110-2,270 ops/sec | ~17-77ms | ~130-200ms |
+
+Roughly a **4-5x throughput improvement** and **6-7x p50 latency
+improvement** over the original baseline, measured across 6 repeated
+runs each. Just as importantly: throughput with 100 concurrent workers is
+now comparable to (and often higher than) 20 workers, rather than
+plateauing at the same number regardless of load — confirming the fix
+addresses the actual bottleneck rather than just moving it.
+
+### Why this is worth documenting as a two-step process
+
+The first attempt at group commit was a reasonable, standard optimization
+that measurably didn't work as intended, and the reason wasn't obvious
+from reading the server-layer code in isolation — it required tracing
+the actual message flow down into `raft.Propose()`'s implementation to
+find. That's a realistic shape for real performance work: the first fix
+addresses a real inefficiency (redundant fsyncs) without addressing the
+actual bottleneck (network fan-out granularity), and confirming that with
+a flat-regardless-of-concurrency throughput number — rather than
+assuming success from a modest apparent improvement — is what caught it.

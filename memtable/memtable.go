@@ -6,9 +6,13 @@
 //
 // Design note: this memtable keeps only the single latest value per key
 // (last write wins), not a version per sequence number. That's a
-// deliberate scope decision — it's what a single-node engine without
-// snapshot reads needs — rather than an oversight; see the package
-// README for what real systems like RocksDB do differently and why.
+// deliberate scope decision, not an oversight: real production engines
+// like RocksDB keep one entry per (key, sequence number) pair instead,
+// so a snapshot taken at sequence N can still read the value as of N
+// even after later writes — buying point-in-time snapshot reads and
+// repeatable range scans under concurrent writes, at the cost of needing
+// compaction to ever reclaim old versions. This project has no
+// snapshot-read feature, so that complexity isn't earning its keep here.
 package memtable
 
 import (

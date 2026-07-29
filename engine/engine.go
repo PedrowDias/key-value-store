@@ -64,6 +64,7 @@ const (
 // correctness) be exercised deterministically and portably.
 type walHandle interface {
 	Append(rec wal.Record) error
+	AppendBatch(recs []wal.Record) error
 	Close() error
 }
 
@@ -249,37 +250,69 @@ func closeAll(entries []*sstableEntry) {
 
 // Put sets key to value.
 func (e *Engine) Put(key, value []byte) error {
-	return e.write(key, value, false)
+	return e.ApplyBatch([]BatchOp{{Key: key, Value: value}})
 }
 
 // Delete removes key. A subsequent Get will report it as not found, even
 // if an older, already-flushed SSTable still holds a stale value for it.
 func (e *Engine) Delete(key []byte) error {
-	return e.write(key, nil, true)
+	return e.ApplyBatch([]BatchOp{{Key: key, Deleted: true}})
 }
 
-func (e *Engine) write(key, value []byte, deleted bool) error {
+// BatchOp is one operation within a batch applied by ApplyBatch.
+type BatchOp struct {
+	Key     []byte
+	Value   []byte // unused when Deleted is true
+	Deleted bool
+}
+
+// ApplyBatch durably applies every op in ops with a single WAL fsync,
+// rather than the N fsyncs that N individual Put/Delete calls would
+// incur — this is group commit, the standard technique for write
+// throughput under concurrent load: fsync latency, not CPU or memory
+// bandwidth, is almost always the real bottleneck for a durable store,
+// and batching amortizes that one unavoidable cost across every
+// operation sharing the batch. Put and Delete are themselves just
+// single-element-batch calls to this, so there is exactly one write
+// path to reason about and test.
+//
+// All ops in a batch share one fsync and one auto-flush check, but each
+// still gets its own sequence number and its own entry in the memtable,
+// applied in order — from the memtable/SSTable's perspective, a batch is
+// indistinguishable from the same N operations having arrived one at a
+// time. The only difference is durability cost.
+func (e *Engine) ApplyBatch(ops []BatchOp) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.closed {
 		return fmt.Errorf("engine: write on a closed engine")
 	}
-
-	seq := e.nextSeq
-	e.nextSeq++
-
-	rt := wal.RecordPut
-	if deleted {
-		rt = wal.RecordDelete
-	}
-	if err := e.w.Append(wal.Record{SeqNum: seq, Type: rt, Key: key, Value: value}); err != nil {
-		return fmt.Errorf("engine: wal append: %w", err)
+	if len(ops) == 0 {
+		return nil
 	}
 
-	if deleted {
-		e.mem.Delete(key, seq)
-	} else {
-		e.mem.Put(key, value, seq)
+	records := make([]wal.Record, len(ops))
+	seqs := make([]uint64, len(ops))
+	for i, op := range ops {
+		seq := e.nextSeq
+		e.nextSeq++
+		seqs[i] = seq
+		rt := wal.RecordPut
+		if op.Deleted {
+			rt = wal.RecordDelete
+		}
+		records[i] = wal.Record{SeqNum: seq, Type: rt, Key: op.Key, Value: op.Value}
+	}
+	if err := e.w.AppendBatch(records); err != nil {
+		return fmt.Errorf("engine: wal append batch: %w", err)
+	}
+
+	for i, op := range ops {
+		if op.Deleted {
+			e.mem.Delete(op.Key, seqs[i])
+		} else {
+			e.mem.Put(op.Key, op.Value, seqs[i])
+		}
 	}
 
 	if e.mem.ApproxSize() >= e.opts.MemtableSizeThreshold {

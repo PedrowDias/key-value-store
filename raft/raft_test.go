@@ -474,6 +474,92 @@ func TestPropose_SingleNodeClusterCommitsImmediately(t *testing.T) {
 	}
 }
 
+// --- ProposeBatch --------------------------------------------------------------
+
+func TestProposeBatch_AppendsAllEntriesInOrder(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2}, ElectionTick: 10, HeartbeatTick: 1})
+	r.becomeCandidate()
+	r.becomeLeader() // single call sequence to force leadership without a real election
+	r.Ready()
+	r.Advance()
+
+	indices, err := r.ProposeBatch([][]byte{[]byte("a"), []byte("b"), []byte("c")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(indices) != 3 || indices[0] != 1 || indices[1] != 2 || indices[2] != 3 {
+		t.Fatalf("indices = %v, want [1 2 3]", indices)
+	}
+	entries := r.Entries(0, 3)
+	if len(entries) != 3 || string(entries[0].Data) != "a" || string(entries[1].Data) != "b" || string(entries[2].Data) != "c" {
+		t.Fatalf("entries = %+v, want [a b c] in order", entries)
+	}
+}
+
+func TestProposeBatch_NotLeaderReturnsErrorAndAppendsNothing(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2}, ElectionTick: 10, HeartbeatTick: 1})
+	_, err := r.ProposeBatch([][]byte{[]byte("a"), []byte("b")})
+	if err != ErrNotLeader {
+		t.Fatalf("err = %v, want ErrNotLeader", err)
+	}
+	if r.Status().LastLogIndex != 0 {
+		t.Fatalf("LastLogIndex = %d, want 0 (nothing should have been appended)", r.Status().LastLogIndex)
+	}
+}
+
+// TestProposeBatch_SendsOneMessagePerPeerNotOnePerEntry is the actual
+// point of ProposeBatch existing at all: verifying that batching several
+// proposals together produces ONE AppendEntries per peer carrying all of
+// them, rather than the N separate messages N individual Propose() calls
+// would produce — which is what an earlier version of this project
+// measured as producing almost no real throughput improvement under
+// concurrent load, despite batching the leader's own WAL persistence.
+func TestProposeBatch_SendsOneMessagePerPeerNotOnePerEntry(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2, 3}, ElectionTick: 10, HeartbeatTick: 1})
+	r.becomeCandidate()
+	r.becomeLeader()
+	r.Ready() // drain the become-leader heartbeat messages
+	r.Advance()
+
+	_, err := r.ProposeBatch([][]byte{[]byte("a"), []byte("b"), []byte("c")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs := r.Ready().Messages
+
+	appendEntriesPerPeer := make(map[uint64]int)
+	var entryCountToPeer2 int
+	for _, m := range msgs {
+		if m.Type != MsgAppendEntries {
+			continue
+		}
+		appendEntriesPerPeer[m.To]++
+		if m.To == 2 {
+			entryCountToPeer2 = len(m.Entries)
+		}
+	}
+	for _, peer := range []uint64{2, 3} {
+		if appendEntriesPerPeer[peer] != 1 {
+			t.Fatalf("peer %d received %d AppendEntries messages, want exactly 1 (all 3 proposals batched into one)", peer, appendEntriesPerPeer[peer])
+		}
+	}
+	if entryCountToPeer2 != 3 {
+		t.Fatalf("the single AppendEntries to peer 2 carried %d entries, want 3", entryCountToPeer2)
+	}
+}
+
+func TestProposeBatch_EmptyBatchStillSucceedsAsLeader(t *testing.T) {
+	r, _ := New(Config{ID: 1, ElectionTick: 10, HeartbeatTick: 1})
+	r.becomeCandidate() // no peers: becomes leader immediately
+	indices, err := r.ProposeBatch(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(indices) != 0 {
+		t.Fatalf("indices = %v, want empty", indices)
+	}
+}
+
 func TestStep_IgnoresMisaddressedMessage(t *testing.T) {
 	r, _ := New(Config{ID: 1, Peers: []uint64{2}, ElectionTick: 10, HeartbeatTick: 1})
 	r.Step(Message{Type: MsgRequestVote, From: 2, To: 99, Term: 1}) // To != our ID

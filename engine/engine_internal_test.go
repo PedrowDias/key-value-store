@@ -25,6 +25,12 @@ func (f *fakeWALHandle) Append(rec wal.Record) error {
 	}
 	return nil
 }
+func (f *fakeWALHandle) AppendBatch(recs []wal.Record) error {
+	if f.failAppend {
+		return errors.New("fakeWALHandle: simulated append failure")
+	}
+	return nil
+}
 func (f *fakeWALHandle) Close() error {
 	if f.failClose {
 		return errors.New("fakeWALHandle: simulated close failure")

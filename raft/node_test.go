@@ -56,6 +56,34 @@ func TestNode_ProposeAndPersistCommitsInSingleNodeCluster(t *testing.T) {
 	}
 }
 
+func TestNode_ProposeBatchCommitsAllInSingleNodeCluster(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "node.wal")
+	n := openTestNode(t, Config{ID: 1, ElectionTick: 10, HeartbeatTick: 1}, path)
+	defer n.Close()
+
+	for i := 0; i < 20; i++ {
+		n.Tick()
+		n.Persist()
+	}
+	indices, err := n.ProposeBatch([][]byte{[]byte("a"), []byte("b"), []byte("c")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(indices) != 3 || indices[0] != 1 || indices[1] != 2 || indices[2] != 3 {
+		t.Fatalf("indices = %v, want [1 2 3]", indices)
+	}
+	if _, err := n.Persist(); err != nil {
+		t.Fatal(err)
+	}
+	if n.Status().CommitIndex != 3 {
+		t.Fatalf("CommitIndex = %d, want 3", n.Status().CommitIndex)
+	}
+	entries := n.Entries(0, 3)
+	if len(entries) != 3 || string(entries[0].Data) != "a" || string(entries[1].Data) != "b" || string(entries[2].Data) != "c" {
+		t.Fatalf("Entries(0,3) = %+v, want [a b c]", entries)
+	}
+}
+
 // --- Recovery across restarts ---------------------------------------------
 
 func TestNode_RecoversHardStateAndLogAcrossRestart(t *testing.T) {
