@@ -175,6 +175,68 @@ func benchmarkMixed(b *testing.B, s store, readPct int) {
 	}
 }
 
+// --- Block cache: repeated reads of the same ("hot") keys -------------------
+
+// hotKeyPopulateSize and hotKeyValueSize are sized so the populated data
+// (2000 * 4096 ≈ 8MB) exceeds the engine's default 4MiB memtable flush
+// threshold, forcing every subsequent Get to fall through to an SSTable
+// on disk — the case this benchmark exists to measure, since a cache
+// has nothing to demonstrate against pure in-memory memtable hits.
+const (
+	hotKeyPopulateSize = 2000
+	hotKeyValueSize    = 4096
+	hotKeySetSize      = 10 // the small subset of keys actually re-read
+)
+
+// BenchmarkGet_HotKeys repeatedly re-reads the SAME small set of keys —
+// unlike BenchmarkGet elsewhere in this file, which reads b.N DISTINCT
+// keys and so never actually exercises a cache hit (each key is read at
+// most once). A block cache has nothing to show for itself against
+// always-cold, never-repeated reads; this benchmark's whole point is
+// measuring what it does for the repeated/"hot" access pattern real
+// workloads actually have.
+func BenchmarkGet_HotKeys(b *testing.B) {
+	b.Run("CacheEnabled", func(b *testing.B) {
+		e, err := engine.Open(engine.Options{Dir: b.TempDir()})
+		if err != nil {
+			b.Fatal(err)
+		}
+		defer e.Close()
+		benchmarkHotKeyGet(b, e)
+	})
+	b.Run("CacheDisabled", func(b *testing.B) {
+		e, err := engine.Open(engine.Options{Dir: b.TempDir(), BlockCacheSize: -1})
+		if err != nil {
+			b.Fatal(err)
+		}
+		defer e.Close()
+		benchmarkHotKeyGet(b, e)
+	})
+}
+
+func benchmarkHotKeyGet(b *testing.B, e store) {
+	rng := rand.New(rand.NewSource(1))
+	value := randomValue(rng, hotKeyValueSize)
+	for i := 0; i < hotKeyPopulateSize; i++ {
+		if err := e.Put(keyFor(i), value); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		// Cycle through only the first hotKeySetSize keys, repeatedly —
+		// every one of these lives in an already-flushed SSTable (the
+		// populate step above exceeds the flush threshold), so every
+		// read here is a real disk read without caching, and a cache
+		// hit after the first pass through the set with it enabled.
+		if _, _, err := e.Get(keyFor(i % hotKeySetSize)); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // --- Concurrent throughput ---------------------------------------------------
 
 func BenchmarkConcurrentPut(b *testing.B) {

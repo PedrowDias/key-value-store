@@ -11,20 +11,37 @@ import (
 
 // Reader opens an existing SSTable file for point lookups and iteration.
 // The index and bloom filter are loaded fully into memory on Open (they're
-// small relative to the data); data blocks are read from disk on demand.
+// small relative to the data); data blocks are read from disk on demand,
+// or served from cache — see OpenWithCache.
 type Reader struct {
 	f          *os.File
+	path       string
+	cache      *BlockCache
 	index      []indexEntry
 	bloom      *bloomFilter
 	numEntries int
 	maxSeq     uint64
 }
 
-// Open opens the SSTable at path, reading its footer, index, and bloom
-// filter. It returns an error if the file is too small, has a bad magic
-// number, or either block fails its checksum — any of which means the
-// file is not a valid, uncorrupted SSTable produced by this package.
+// Open opens the SSTable at path with no block cache — equivalent to
+// OpenWithCache(path, nil). See OpenWithCache for the caching variant.
 func Open(path string) (*Reader, error) {
+	return OpenWithCache(path, nil)
+}
+
+// OpenWithCache opens the SSTable at path, reading its footer, index,
+// and bloom filter. It returns an error if the file is too small, has a
+// bad magic number, or either block fails its checksum — any of which
+// means the file is not a valid, uncorrupted SSTable produced by this
+// package.
+//
+// If cache is non-nil, data blocks this Reader reads are served from
+// (and populate) it, shared with any other Reader given the same cache
+// instance — see BlockCache's own doc for why sharing across files is
+// what makes this actually useful. A nil cache means no caching: every
+// Get and iteration reads from disk every time, exactly as before this
+// existed.
+func OpenWithCache(path string, cache *BlockCache) (*Reader, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("sstable: open %s: %w", path, err)
@@ -79,7 +96,7 @@ func Open(path string) (*Reader, error) {
 		return nil, fmt.Errorf("sstable: decoding index: %w", err)
 	}
 
-	return &Reader{f: f, index: index, bloom: bloom, numEntries: int(numEntries), maxSeq: maxSeq}, nil
+	return &Reader{f: f, path: path, cache: cache, index: index, bloom: bloom, numEntries: int(numEntries), maxSeq: maxSeq}, nil
 }
 
 // readChecksummed reads a length-prefixed-by-the-caller block at the given
@@ -115,6 +132,23 @@ func (r *Reader) MaxSeq() uint64 {
 	return r.maxSeq
 }
 
+// readDataBlock returns the checksum-verified bytes of the data block at
+// blk, from the cache if present there, otherwise from disk — populating
+// the cache on a miss so a subsequent read of the same block (via this
+// Reader or any other sharing the same cache) is a map lookup instead of
+// a disk read and CRC32C verification.
+func (r *Reader) readDataBlock(blk indexEntry) ([]byte, error) {
+	if data, ok := r.cache.get(r.path, blk.offset); ok {
+		return data, nil
+	}
+	data, err := readChecksummed(r.f, blk.offset, blk.length)
+	if err != nil {
+		return nil, err
+	}
+	r.cache.put(r.path, blk.offset, data)
+	return data, nil
+}
+
 // Get looks up key. found is false if the key isn't in this table at all.
 // If found is true and deleted is true, this table holds a tombstone for
 // the key — the caller (the engine, consulting multiple SSTables newest
@@ -138,7 +172,7 @@ func (r *Reader) Get(key []byte) (value []byte, seq uint64, deleted bool, found 
 	}
 
 	blk := r.index[i]
-	data, rerr := readChecksummed(r.f, blk.offset, blk.length)
+	data, rerr := r.readDataBlock(blk)
 	if rerr != nil {
 		return nil, 0, false, false, fmt.Errorf("sstable: reading data block: %w", rerr)
 	}
@@ -192,7 +226,7 @@ func (it *Iterator) loadBlock(idx int) {
 		return
 	}
 	blk := it.r.index[idx]
-	data, err := readChecksummed(it.r.f, blk.offset, blk.length)
+	data, err := it.r.readDataBlock(blk)
 	if err != nil {
 		it.err = fmt.Errorf("sstable: iterator reading block %d: %w", idx, err)
 		it.entries = nil

@@ -44,6 +44,74 @@ accordingly. That's the correct, expected behavior of an LSM engine (the
 same tradeoff LevelDB/RocksDB/Cassandra make), and it's worth stating
 explicitly rather than only reporting the two most flattering rows.
 
+## Closing the 4096B gap: a shared SSTable block cache
+
+The `NumEntries=2000` row above is a **cold-read** benchmark: `b.N`
+iterations there each read a distinct key, so the same data block never
+gets requested twice within one run — exactly the access pattern a block
+cache has nothing to offer, since there's no repeat to serve from
+memory. Real workloads are rarely like that; some keys get read far more
+often than others ("hot" keys), and every one of those repeat reads was
+still paying a full disk read and CRC32C verification every time, even
+for data read a moment earlier.
+
+`sstable.BlockCache` (an LRU cache of checksum-verified data blocks,
+keyed by file and byte offset) closes this: `engine.Engine` creates one
+and shares it across every SSTable it ever opens, on recovery and on
+every subsequent flush, so a repeated read of the same block — even
+across different flushed tables over the store's lifetime — is served
+from memory. `BenchmarkGet_HotKeys` measures exactly this: the same
+2000-entry, 8MB (past-flush-threshold) table as above, but repeatedly
+re-reading only a small (10-key) hot subset instead of `b.N` distinct
+keys:
+
+```bash
+go test ./bench/... -bench=BenchmarkGet_HotKeys -benchmem -benchtime=1000x -run=^$
+```
+
+| Environment | Enabled | Disabled | Speedup |
+|---|---|---|---|
+| Sandbox (3 runs) | 2,722-4,402 ns/op | 6,918-9,191 ns/op | 1.7-2.5x |
+| Apple M3 | 6,460 ns/op | 7,500 ns/op | **1.16x** |
+
+The cache is a real, consistent, positive improvement on real hardware —
+just a much more modest one than the sandbox measurement suggested,
+which is worth understanding rather than quietly reporting whichever
+number looks better. The likely explanation: this benchmark's "Disabled"
+case isn't actually measuring cold physical-disk latency on the M3.
+macOS's page cache is aggressive, and an 8MB test file comfortably fits
+in it — so even with the *application-level* `BlockCache` turned off,
+the OS is very likely still serving these repeated reads from its own
+cache underneath, at the page/`read(2)` level. What `BlockCache` adds on
+top of that is avoiding the remaining `read` syscall and CRC32C
+re-verification — real, measurable savings (1.16x), just smaller than
+"avoiding a real disk read" would be, because a real disk read mostly
+isn't what's actually happening in the "disabled" case on this hardware.
+The sandbox's larger ratio is consistent with this: a container's
+storage layer (frequently an overlay filesystem, sometimes with less
+effective or differently-configured caching) is more likely to impose
+real per-read cost that page caching doesn't fully hide, so removing it
+via an application-level cache shows a bigger relative gain there.
+
+This is also a reasonable, general point about block caches specifically
+(not just this one): their marginal value depends heavily on what's
+underneath them. They matter most when the OS cache is under memory
+pressure, when the working set doesn't fit in available RAM at all, or
+on storage where the per-read cost (network-attached storage, especially)
+is higher than a local NVMe SSD's. On a single machine with a small
+dataset and a lot of free RAM, an application-level cache's job is
+partly already being done by the kernel — which doesn't make it
+worthless, but does mean 1.16x, not 2x, is the honest number for this
+specific hardware and workload size.
+
+The cache is turned on by
+default (`Options.BlockCacheSize`, 8 MiB default; a negative value
+disables it entirely, matching pre-cache behavior for comparison, which
+is exactly how the "Disabled" row above was produced) — every existing
+benchmark and correctness test in this project already runs with it
+active, and none of their numbers meaningfully changed, since none of
+them previously exercised a repeated-read pattern.
+
 ## Put (write-heavy), 100 iterations
 
 | Value size | Engine | NaiveStore | Speedup |

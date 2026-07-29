@@ -207,7 +207,7 @@ func TestFlush_ReopenAfterFinishErrorPropagates(t *testing.T) {
 	// Finish() just wrote successfully essentially always reopens fine.
 	orig := openSSTableForRead
 	calls := 0
-	openSSTableForRead = func(path string) (sstableReader, error) {
+	openSSTableForRead = func(path string, cache *sstable.BlockCache) (sstableReader, error) {
 		calls++
 		return nil, errors.New("openSSTableForRead: simulated failure")
 	}
@@ -296,7 +296,7 @@ func TestOpen_WALOpenErrorPropagates(t *testing.T) {
 // --- discoverSSTables, direct and closeAll with real entries ---------------
 
 func TestDiscoverSSTables_ReadDirErrorOnNonexistentPath(t *testing.T) {
-	_, _, _, err := discoverSSTables(filepath.Join(t.TempDir(), "does-not-exist"))
+	_, _, _, err := discoverSSTables(filepath.Join(t.TempDir(), "does-not-exist"), sstable.NewBlockCache(defaultBlockCacheSize))
 	if err == nil {
 		t.Fatal("expected an error listing a nonexistent directory")
 	}

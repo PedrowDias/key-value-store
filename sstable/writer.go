@@ -16,6 +16,14 @@
 // (file size - 56), read the footer, then jump straight to the index —
 // no need to scan the file to find anything. This mirrors the
 // footer-at-EOF design LevelDB/RocksDB use for the same reason.
+//
+// OpenWithCache lets multiple Readers share a BlockCache: a size-bounded
+// LRU cache of checksum-verified data blocks, keyed by (file, offset).
+// This exists to close a real, measured gap — repeated reads of data
+// that's fallen through to disk (past the memtable) otherwise pay a real
+// disk read and CRC32C verification on every single call, even for a key
+// just read a moment ago. See bench/BENCHMARKS.md for the measured
+// effect.
 package sstable
 
 import (

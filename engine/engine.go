@@ -21,6 +21,12 @@
 // Read path: check the memtable first, then consult SSTables from newest
 // to oldest, returning on the first hit (a tombstone counts as a hit —
 // finding one for a key means "deleted," not "keep looking further back").
+// A single sstable.BlockCache (see Options.BlockCacheSize) is shared
+// across every SSTable this Engine ever opens — on recovery and on every
+// subsequent flush — so a repeated read of the same data block, even
+// across different flushed tables over the store's lifetime, is served
+// from memory rather than paying a disk read and checksum verification
+// again.
 //
 // Concurrency: a single sync.RWMutex guards everything. Writes (and any
 // flush they trigger) take the write lock; reads take the read lock. This
@@ -51,6 +57,7 @@ const (
 	walFileName            = "wal.log"
 	sstableFileNamePattern = "%06d.sst"
 	defaultMemtableSizeMax = 4 * 1024 * 1024 // 4 MiB
+	defaultBlockCacheSize  = 8 * 1024 * 1024 // 8 MiB
 )
 
 // walHandle, sstableWriter, and sstableReader are minimal interfaces over
@@ -86,8 +93,8 @@ var (
 	newSSTableWriter = func(path string, opts sstable.Options) (sstableWriter, error) {
 		return sstable.NewWriter(path, opts)
 	}
-	openSSTableForRead = func(path string) (sstableReader, error) {
-		return sstable.Open(path)
+	openSSTableForRead = func(path string, cache *sstable.BlockCache) (sstableReader, error) {
+		return sstable.OpenWithCache(path, cache)
 	}
 )
 
@@ -104,11 +111,21 @@ type Options struct {
 	// Zero values use sstable's own defaults.
 	SSTableBlockSize   int
 	SSTableBloomFPRate float64
+	// BlockCacheSize bounds, in bytes, how much decoded SSTable block
+	// data is kept in memory across every SSTable this Engine has open,
+	// shared across all of them (see sstable.BlockCache's own doc for
+	// why sharing matters). Defaults to 8 MiB. A negative value disables
+	// caching entirely — every read goes to disk, matching this
+	// project's behavior before the cache existed.
+	BlockCacheSize int64
 }
 
 func (o Options) withDefaults() Options {
 	if o.MemtableSizeThreshold <= 0 {
 		o.MemtableSizeThreshold = defaultMemtableSizeMax
+	}
+	if o.BlockCacheSize == 0 {
+		o.BlockCacheSize = defaultBlockCacheSize
 	}
 	return o
 }
@@ -126,6 +143,13 @@ type Engine struct {
 
 	w   walHandle
 	mem *memtable.Memtable
+
+	// cache is shared across every SSTable this Engine opens (on
+	// recovery and on every subsequent flush) — see
+	// sstable.BlockCache's own doc for why sharing across files, not
+	// just within one, is what makes a block cache actually earn its
+	// keep in a workload that reads across many flushed tables.
+	cache *sstable.BlockCache
 
 	// sstables is ordered newest-first (index 0 = most recently flushed),
 	// matching the order reads must consult them in.
@@ -146,7 +170,9 @@ func Open(opts Options) (*Engine, error) {
 		return nil, fmt.Errorf("engine: creating directory %s: %w", opts.Dir, err)
 	}
 
-	sstables, nextFlushSeq, maxSeqFromTables, err := discoverSSTables(opts.Dir)
+	cache := sstable.NewBlockCache(opts.BlockCacheSize)
+
+	sstables, nextFlushSeq, maxSeqFromTables, err := discoverSSTables(opts.Dir, cache)
 	if err != nil {
 		return nil, err
 	}
@@ -187,17 +213,19 @@ func Open(opts Options) (*Engine, error) {
 		opts:         opts,
 		w:            w,
 		mem:          mem,
+		cache:        cache,
 		sstables:     sstables,
 		nextSeq:      nextSeq,
 		nextFlushSeq: nextFlushSeq,
 	}, nil
 }
 
-// discoverSSTables scans dir for existing "NNNNNN.sst" files, opens each,
-// and returns them ordered newest-first, along with the flush-sequence
-// number to use for the next new SSTable and the highest MaxSeq among
-// them (used to resume sequence-number allocation after a restart).
-func discoverSSTables(dir string) (sstables []*sstableEntry, nextFlushSeq int, maxSeq uint64, err error) {
+// discoverSSTables scans dir for existing "NNNNNN.sst" files, opens each
+// (sharing cache across all of them), and returns them ordered
+// newest-first, along with the flush-sequence number to use for the
+// next new SSTable and the highest MaxSeq among them (used to resume
+// sequence-number allocation after a restart).
+func discoverSSTables(dir string, cache *sstable.BlockCache) (sstables []*sstableEntry, nextFlushSeq int, maxSeq uint64, err error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, 0, 0, fmt.Errorf("engine: listing %s: %w", dir, err)
@@ -225,7 +253,7 @@ func discoverSSTables(dir string) (sstables []*sstableEntry, nextFlushSeq int, m
 	for i := len(nums) - 1; i >= 0; i-- {
 		n := nums[i]
 		path := filepath.Join(dir, numToName[n])
-		r, openErr := openSSTableForRead(path)
+		r, openErr := openSSTableForRead(path, cache)
 		if openErr != nil {
 			closeAll(sstables)
 			return nil, 0, 0, fmt.Errorf("engine: opening existing sstable %s: %w", path, openErr)
@@ -397,7 +425,7 @@ func (e *Engine) flushLocked() error {
 		return fmt.Errorf("engine: finishing sstable: %w", err)
 	}
 
-	reader, err := openSSTableForRead(path)
+	reader, err := openSSTableForRead(path, e.cache)
 	if err != nil {
 		return fmt.Errorf("engine: reopening flushed sstable: %w", err)
 	}

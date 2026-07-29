@@ -104,6 +104,25 @@ directly visible in the benchmark numbers below — reads that stay in the
 Bloom-filter-covered path are 50-70x faster than a naive per-key file
 read.
 
+**A shared block cache, added after the benchmarks found where it was
+missing.** The Bloom-filter path above only helps a read stay *out* of
+an SSTable; once data exceeds the memtable and a read genuinely needs
+one, the original implementation paid a full disk read and CRC32C
+verification on every single call — even for a key read a moment
+earlier. `sstable.BlockCache` is a size-bounded LRU cache of
+already-verified blocks, shared across every SSTable an `engine.Engine`
+ever opens (not just within one file), so a repeated read of the same
+block is a map lookup instead. Confirmed as a real, positive improvement
+on real hardware (Apple M3: 1.16x for repeated hot-key reads) — smaller
+than a sandbox measurement initially suggested (1.7-2.5x), and the gap
+itself turned out to be informative: a fast machine's OS page cache is
+likely already absorbing most of a "cold" read's cost for a small
+dataset, so an application-level cache's marginal value depends heavily
+on what's already underneath it. See
+[`bench/BENCHMARKS.md`](bench/BENCHMARKS.md) for the benchmark that's
+actually designed to show this (the earlier cold-read benchmarks
+couldn't, since they never request the same block twice).
+
 **Raft's `Ready`/`Advance` contract enforces a real safety invariant.**
 `Ready()` returns unpersisted state; the caller MUST persist it before
 sending any messages, before calling `Advance()`. Getting this ordering
@@ -214,6 +233,7 @@ Full methodology and every number in
 | Measurement | Result |
 |---|---|
 | Storage engine reads vs. a naive (but genuinely durable) baseline | up to **70x** faster |
+| Block cache: repeated ("hot key") reads once data exceeds the memtable | **1.16x** faster, confirmed on Apple M3 (sandbox measured 1.7-2.5x — see [`bench/BENCHMARKS.md`](bench/BENCHMARKS.md) for why real hardware showed less, and why that's not a red flag) |
 | Storage engine writes vs. the same baseline | **1.2-1.3x** faster (both durably `fsync`; this isolates filesystem overhead, not durability) |
 | Real cluster write throughput, sandbox: no batching -> `ProposeBatch` | ~280 -> ~1,300-1,600 ops/sec (same hardware) |
 | Real cluster write throughput, `ProposeBatch` + batch window, confirmed on Apple M3 | ~90-2,240 ops/sec depending on window size, matching or exceeding the pre-regression baseline on every window tested — full four-round investigation (including a real regression found and fixed) in [`bench/BENCHMARKS.md`](bench/BENCHMARKS.md) |
@@ -252,8 +272,6 @@ cluster.
   (see above).
 - **No async memtable flush**: a flush currently blocks the writer that
   triggers it.
-- **No SSTable block cache**: repeated reads that fall through to disk
-  re-read and re-decode the same block every time.
 
 ## Project layout
 
