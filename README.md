@@ -123,6 +123,30 @@ on what's already underneath it. See
 actually designed to show this (the earlier cold-read benchmarks
 couldn't, since they never request the same block twice).
 
+**Async memtable flush, verified with a fair before/after — including
+where it doesn't help as much as hoped.** The original engine held its
+single write lock for an entire flush (walking the whole memtable,
+writing a new SSTable); whichever write crossed the size threshold, and
+everyone else waiting on that lock, paid the full cost. Async flush
+freezes the memtable, hands writes a fresh one immediately, and does the
+disk I/O in the background. Confirming the benefit meant building a real
+comparison, not just asserting one: `bench/engine_bench_test.go`'s
+`syncFlushStore` is a faithful reconstruction of the original design
+using the same real `wal`/`memtable`/`sstable` packages, so measuring
+against it isolates locking discipline, not implementation quality. The
+result is genuinely two-sided: for a single writer, the specific write
+that triggers a flush is **3.5-4.7x faster** and far less variable,
+consistently across 9 runs — exactly the claim confirmed cleanly. Under
+sustained *concurrent* load, the picture is much messier — sometimes
+comparable, sometimes worse than the synchronous design — because this
+project bounds itself to at most one flush in flight at a time (a
+deliberate simplicity tradeoff over an unbounded queue of pending
+memtables), so under heavy concurrency nearly every writer ends up
+waiting for *some* flush to finish one way or another. Reported plainly
+rather than only citing the flattering isolated number — see
+[`bench/BENCHMARKS.md`](bench/BENCHMARKS.md) for both results and why
+the gap exists.
+
 **Raft's `Ready`/`Advance` contract enforces a real safety invariant.**
 `Ready()` returns unpersisted state; the caller MUST persist it before
 sending any messages, before calling `Advance()`. Getting this ordering
@@ -224,6 +248,17 @@ of what this project actually demonstrates.
   without insisting on real-hardware confirmation even after a
   sandbox result already looked like success — see the design section
   above and `bench/BENCHMARKS.md` for the full account.
+- **Async flush's benchmark scared me before it taught me anything.**
+  Real cluster testing showed writes succeeding but zero SSTable files
+  ever appearing — investigated with goroutine dumps and stage-by-stage
+  logging before finding the actual cause: my own test script was
+  checking the wrong directory (`n1/*.sst` instead of `n1/kv/*.sst`,
+  the engine's real data subdirectory). No bug existed. Once past that,
+  building a fair comparison against the original synchronous design
+  (using the same real underlying packages, not a toy stand-in) found a
+  genuinely two-sided result: a clean, large win for the isolated case
+  the feature targets, and a real, honestly-documented limitation under
+  heavy concurrent load — see the design section above.
 
 ## Benchmark results
 
@@ -234,6 +269,8 @@ Full methodology and every number in
 |---|---|
 | Storage engine reads vs. a naive (but genuinely durable) baseline | up to **70x** faster |
 | Block cache: repeated ("hot key") reads once data exceeds the memtable | **1.16x** faster, confirmed on Apple M3 (sandbox measured 1.7-2.5x — see [`bench/BENCHMARKS.md`](bench/BENCHMARKS.md) for why real hardware showed less, and why that's not a red flag) |
+| Async flush: the write that triggers a flush, single writer | **3.5-4.7x** faster mean latency, far less variable (consistent across 9 runs) |
+| Async flush: aggregate p99 under heavy concurrent load | Mixed — sometimes worse than synchronous flush, due to this project's at-most-one-flush-in-flight bound (see [`bench/BENCHMARKS.md`](bench/BENCHMARKS.md)) |
 | Storage engine writes vs. the same baseline | **1.2-1.3x** faster (both durably `fsync`; this isolates filesystem overhead, not durability) |
 | Real cluster write throughput, sandbox: no batching -> `ProposeBatch` | ~280 -> ~1,300-1,600 ops/sec (same hardware) |
 | Real cluster write throughput, `ProposeBatch` + batch window, confirmed on Apple M3 | ~90-2,240 ops/sec depending on window size, matching or exceeding the pre-regression baseline on every window tested — full four-round investigation (including a real regression found and fixed) in [`bench/BENCHMARKS.md`](bench/BENCHMARKS.md) |
@@ -270,8 +307,14 @@ cluster.
   installing a snapshot.
 - **No `ReadIndex`**: reads are eventually consistent, not linearizable
   (see above).
-- **No async memtable flush**: a flush currently blocks the writer that
-  triggers it.
+- **Async flush bounds itself to one flush in flight at a time**: a
+  concurrent write that arrives while a flush is already running waits
+  for it to finish rather than starting a second one. Simpler to reason
+  about than an unbounded queue of pending memtables, but it measurably
+  narrows the feature's benefit under sustained high write concurrency —
+  see [`bench/BENCHMARKS.md`](bench/BENCHMARKS.md) for the real numbers,
+  both where the design clearly wins and where this bound's cost shows
+  up.
 
 ## Project layout
 

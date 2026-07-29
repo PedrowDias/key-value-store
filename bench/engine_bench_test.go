@@ -12,10 +12,18 @@ package bench
 import (
 	"fmt"
 	"math/rand"
+	"os"
+	"path/filepath"
+	"sort"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/PedrowDias/key-value-store/engine"
+	"github.com/PedrowDias/key-value-store/memtable"
+	"github.com/PedrowDias/key-value-store/sstable"
+	"github.com/PedrowDias/key-value-store/wal"
 )
 
 // store is the minimal interface both engine.Engine and NaiveStore
@@ -266,5 +274,309 @@ func benchmarkConcurrentPut(b *testing.B, s store) {
 				b.Fatal(err)
 			}
 		}
+	})
+}
+
+// --- Async vs. synchronous flush: write-latency tail under sustained load ---
+
+// syncFlushStore is a minimal, faithful reconstruction of this project's
+// ORIGINAL flush design (before it became asynchronous): Put holds one
+// mutex for its entire duration, including — when triggered — walking
+// the whole memtable and writing a new SSTable, all while every other
+// concurrent Put is blocked waiting on the same mutex. It uses the
+// exact same real wal/memtable/sstable packages as engine.Engine, not a
+// simplified stand-in, so a benchmark comparing the two measures a real
+// difference in locking discipline, not a difference in what work gets
+// done. This exists purely for that comparison; it is not used anywhere
+// else in this project.
+type syncFlushStore struct {
+	mu   sync.Mutex
+	dir  string
+	opts engineLikeOptions
+
+	w   *wal.WAL
+	mem *memtable.Memtable
+
+	sstables     []*sstable.Reader
+	nextSeq      uint64
+	nextFlushSeq int
+}
+
+type engineLikeOptions struct {
+	MemtableSizeThreshold int64
+}
+
+func newSyncFlushStore(dir string, threshold int64) (*syncFlushStore, error) {
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, err
+	}
+	w, err := wal.Open(filepath.Join(dir, "sync.wal"), wal.Options{SyncOnWrite: true})
+	if err != nil {
+		return nil, err
+	}
+	return &syncFlushStore{
+		dir:  dir,
+		opts: engineLikeOptions{MemtableSizeThreshold: threshold},
+		w:    w,
+		mem:  memtable.New(),
+	}, nil
+}
+
+func (s *syncFlushStore) Put(key, value []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	seq := s.nextSeq
+	s.nextSeq++
+	if err := s.w.Append(wal.Record{SeqNum: seq, Type: wal.RecordPut, Key: key, Value: value}); err != nil {
+		return err
+	}
+	s.mem.Put(key, value, seq)
+
+	if s.mem.ApproxSize() >= s.opts.MemtableSizeThreshold {
+		// The synchronous part this whole benchmark exists to measure
+		// the cost of: every concurrent Put waiting on s.mu blocks for
+		// this entire flush, not just the metadata swap.
+		path := filepath.Join(s.dir, fmt.Sprintf("%06d.sst", s.nextFlushSeq))
+		sw, err := sstable.NewWriter(path, sstable.Options{})
+		if err != nil {
+			return err
+		}
+		it := s.mem.NewIterator()
+		for it.SeekToFirst(); it.Valid(); it.Next() {
+			if err := sw.Add(it.Key(), it.Value(), it.SeqNum(), it.Deleted()); err != nil {
+				return err
+			}
+		}
+		if _, err := sw.Finish(); err != nil {
+			return err
+		}
+		reader, err := sstable.Open(path)
+		if err != nil {
+			return err
+		}
+		s.sstables = append([]*sstable.Reader{reader}, s.sstables...)
+		s.nextFlushSeq++
+		s.mem = memtable.New()
+	}
+	return nil
+}
+
+func (s *syncFlushStore) Get(key []byte) ([]byte, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if val, _, deleted, found := s.mem.Get(key); found {
+		return val, !deleted, nil
+	}
+	for _, r := range s.sstables {
+		val, _, deleted, found, err := r.Get(key)
+		if err != nil {
+			return nil, false, err
+		}
+		if found {
+			return val, !deleted, nil
+		}
+	}
+	return nil, false, nil
+}
+
+func (s *syncFlushStore) Delete(key []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seq := s.nextSeq
+	s.nextSeq++
+	if err := s.w.Append(wal.Record{SeqNum: seq, Type: wal.RecordDelete, Key: key}); err != nil {
+		return err
+	}
+	s.mem.Delete(key, seq)
+	return nil
+}
+
+func (s *syncFlushStore) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.sstables {
+		r.Close()
+	}
+	return s.w.Close()
+}
+
+// benchmarkWriteLatencyTail runs numWorkers concurrent writers issuing a
+// fixed number of Puts each against s, recording every individual Put's
+// latency, and reports p50/p99/max at the end — the distribution is the
+// point, not the mean: async flush's whole benefit is bounding how badly
+// the UNLUCKY write that happens to arrive during a flush (or, for
+// syncFlushStore, EVERY write concurrent with one) gets stalled.
+func benchmarkWriteLatencyTail(b *testing.B, s store, numWorkers, putsPerWorker int, valSize int) {
+	b.Helper()
+	value := randomValue(rand.New(rand.NewSource(1)), valSize)
+
+	total := numWorkers * putsPerWorker
+	latencies := make([]time.Duration, total)
+	var idx int64
+
+	var wg sync.WaitGroup
+	start := time.Now()
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for j := 0; j < putsPerWorker; j++ {
+				key := keyFor(workerID*putsPerWorker + j)
+				t0 := time.Now()
+				if err := s.Put(key, value); err != nil {
+					b.Error(err)
+					return
+				}
+				i := atomic.AddInt64(&idx, 1) - 1
+				latencies[i] = time.Since(t0)
+			}
+		}(w)
+	}
+	wg.Wait()
+	wall := time.Since(start)
+
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	p50 := latencies[len(latencies)*50/100]
+	p99 := latencies[len(latencies)*99/100]
+	max := latencies[len(latencies)-1]
+
+	b.ReportMetric(float64(p50.Microseconds()), "p50-us")
+	b.ReportMetric(float64(p99.Microseconds()), "p99-us")
+	b.ReportMetric(float64(max.Microseconds()), "max-us")
+	b.ReportMetric(float64(total)/wall.Seconds(), "ops/sec")
+}
+
+// BenchmarkWriteLatencyTail_TriggeringWriteOnly isolates the specific
+// claim async flush makes — the write whose own operation crosses the
+// threshold does not itself pay the disk-I/O cost of flushing — by
+// measuring ONLY the latency of writes that actually trigger a flush,
+// not diluting the signal across the many surrounding writes that don't
+// (a sequential run of numPuts writes with this threshold only crosses
+// it a handful of times, so an aggregate p50/max over ALL writes is
+// dominated by ordinary per-write cost and doesn't show the effect
+// cleanly). BenchmarkWriteLatencyTail_AsyncVsSyncFlush below shows
+// concurrent-contention effects are a real, separate factor under
+// sustained heavy load; this benchmark isolates the simpler question —
+// does MY write block on MY OWN flush — from that.
+func BenchmarkWriteLatencyTail_TriggeringWriteOnly(b *testing.B) {
+	const (
+		numPuts   = 2000
+		valSize   = 2000
+		threshold = 200 * 1024
+	)
+
+	b.Run("Async", func(b *testing.B) {
+		e, err := engine.Open(engine.Options{Dir: b.TempDir(), MemtableSizeThreshold: threshold})
+		if err != nil {
+			b.Fatal(err)
+		}
+		defer e.Close()
+		var wasInProgress bool
+		lats := benchmarkTriggeringWriteLatencies(b, e, numPuts, valSize, func() bool {
+			now := e.Stats().FlushInProgress
+			triggered := now && !wasInProgress // only the false->true edge: the write that STARTED this flush, not every subsequent quick write while it's still finishing
+			wasInProgress = now
+			return triggered
+		})
+		reportTriggeringLatencies(b, lats)
+	})
+
+	b.Run("SyncFlush", func(b *testing.B) {
+		s, err := newSyncFlushStore(b.TempDir(), threshold)
+		if err != nil {
+			b.Fatal(err)
+		}
+		defer s.Close()
+		var flushCountBefore int
+		lats := benchmarkTriggeringWriteLatencies(b, s, numPuts, valSize, func() bool {
+			s.mu.Lock()
+			n := len(s.sstables)
+			s.mu.Unlock()
+			triggered := n > flushCountBefore
+			flushCountBefore = n
+			return triggered
+		})
+		reportTriggeringLatencies(b, lats)
+	})
+}
+
+// benchmarkTriggeringWriteLatencies runs numPuts sequential writes,
+// recording the latency of any write immediately after which
+// triggered() reports true (a flush having just started/happened) and
+// returning just those latencies.
+func benchmarkTriggeringWriteLatencies(b *testing.B, s store, numPuts, valSize int, triggered func() bool) []time.Duration {
+	b.Helper()
+	value := randomValue(rand.New(rand.NewSource(1)), valSize)
+	var triggering []time.Duration
+	for i := 0; i < numPuts; i++ {
+		t0 := time.Now()
+		if err := s.Put(keyFor(i), value); err != nil {
+			b.Fatal(err)
+		}
+		lat := time.Since(t0)
+		if triggered() {
+			triggering = append(triggering, lat)
+		}
+	}
+	return triggering
+}
+
+func reportTriggeringLatencies(b *testing.B, lats []time.Duration) {
+	b.Helper()
+	if len(lats) == 0 {
+		b.Fatal("no flush was triggered during this run — threshold/workload mismatch")
+	}
+	sort.Slice(lats, func(i, j int) bool { return lats[i] < lats[j] })
+	var sum time.Duration
+	for _, l := range lats {
+		sum += l
+	}
+	b.ReportMetric(float64(lats[0].Microseconds()), "min-us")
+	b.ReportMetric(float64(sum.Microseconds())/float64(len(lats)), "mean-us")
+	b.ReportMetric(float64(lats[len(lats)-1].Microseconds()), "max-us")
+	b.ReportMetric(float64(len(lats)), "flush-count")
+}
+
+// BenchmarkWriteLatencyTail_AsyncVsSyncFlush measures the SAME general
+// workload shape under sustained CONCURRENT load (many goroutines, many
+// flushes) rather than a single sequential writer. This is a genuinely
+// more complicated picture than BenchmarkWriteLatencyTail_TriggeringWriteOnly's
+// clean result: because this project bounds itself to at most one flush
+// in flight at a time (see Engine's package doc), ANY concurrent write
+// that arrives while a flush is running — not only one that would
+// itself start a SECOND flush — waits for that flush to finish, via
+// waitForAnyFlushLocked. Under heavy sustained concurrency with frequent
+// flushes, nearly every writer ends up waiting for flush completion one
+// way or another, which measurably narrows (and in some runs reverses)
+// the aggregate latency-percentile advantage over synchronous flush,
+// where the same writers would instead be contending for one mutex. Run
+// with:
+//
+//	go test ./bench/... -bench=BenchmarkWriteLatencyTail -run=^$
+func BenchmarkWriteLatencyTail_AsyncVsSyncFlush(b *testing.B) {
+	const (
+		numWorkers    = 20
+		putsPerWorker = 100
+		valSize       = 2000
+		threshold     = 200 * 1024 // small enough that this workload crosses it many times
+	)
+
+	b.Run("Async", func(b *testing.B) {
+		e, err := engine.Open(engine.Options{Dir: b.TempDir(), MemtableSizeThreshold: threshold})
+		if err != nil {
+			b.Fatal(err)
+		}
+		defer e.Close()
+		benchmarkWriteLatencyTail(b, e, numWorkers, putsPerWorker, valSize)
+	})
+
+	b.Run("SyncFlush", func(b *testing.B) {
+		s, err := newSyncFlushStore(b.TempDir(), threshold)
+		if err != nil {
+			b.Fatal(err)
+		}
+		defer s.Close()
+		benchmarkWriteLatencyTail(b, s, numWorkers, putsPerWorker, valSize)
 	})
 }

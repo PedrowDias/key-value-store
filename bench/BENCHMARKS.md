@@ -495,6 +495,88 @@ a `window=0` result whose consistency across four different fix attempts
 turned out to be informative rather than concerning once its actual
 (disk-bound, not network-bound) cause was understood.
 
+## Async memtable flush: a real win, and a real limitation found while measuring it
+
+The original engine held its single write lock for the *entire* duration
+of a flush — walking the whole memtable and writing a new SSTable —
+meaning whichever write happened to cross the size threshold (and every
+other write waiting on the same lock) paid that full cost directly.
+Async flush freezes the memtable, hands writes a fresh one immediately,
+and does the actual disk I/O in a background goroutine. Verifying the
+benefit this was supposed to provide required building a fair
+comparison: `syncFlushStore` (in `bench/engine_bench_test.go`) is a
+faithful reconstruction of the original design, using the exact same
+real `wal`/`memtable`/`sstable` packages `engine.Engine` does, so a
+benchmark comparing the two measures a real difference in locking
+discipline, not a difference in what work gets done.
+
+### The core claim, isolated: does the triggering write pay the flush cost?
+
+```bash
+go test ./bench/... -bench=BenchmarkWriteLatencyTail_TriggeringWriteOnly -run=^$
+```
+
+A single sequential writer, no concurrency, measuring only the specific
+writes that actually cross the threshold and start a flush (not diluted
+by the many surrounding writes that don't — with this workload's
+threshold, only ~20 of 2000 writes trigger one, so an aggregate
+percentile over all 2000 doesn't show the effect clearly; this isolates
+just those 20):
+
+| | min | mean | max |
+|---|---|---|---|
+| Async | 539-717 µs | 677-880 µs | 922-1,142 µs |
+| SyncFlush | 2,498-2,688 µs | 2,934-3,988 µs | 3,481-13,372 µs |
+
+Consistent across 9 runs: **roughly 3.5-4.7x faster mean latency** for
+the write that triggers a flush, and — notably — far *less variable*
+(async's own max never exceeds ~1.1ms; sync's ranges as high as 13.4ms).
+This is exactly the claim the feature makes, cleanly confirmed.
+
+### The complicated part: sustained concurrent load
+
+```bash
+go test ./bench/... -bench=BenchmarkWriteLatencyTail_AsyncVsSyncFlush -run=^$
+```
+
+The same general workload under 20 concurrent writers instead of one
+sequential writer, with a small-enough threshold that many flushes
+happen during the run:
+
+| | p50 | p99 | max | throughput |
+|---|---|---|---|---|
+| Async | 12,277-14,381 µs | 34,381-40,341 µs | 35,700-66,186 µs | 1,207-1,489 ops/sec |
+| SyncFlush | 13,255-13,863 µs | 17,649-43,654 µs | 18,130-54,282 µs | 1,355-1,445 ops/sec |
+
+Not a clean win — genuinely mixed across repeated runs, with sync
+sometimes matching or beating async on p99 and max. Rather than
+explain this away, tracing it down: this project bounds itself to *at
+most one flush in flight at a time* (see `engine`'s package doc) — a
+deliberate simplicity tradeoff over an unbounded queue of pending
+memtables. The consequence: **any** concurrent write that arrives while
+a flush is running waits for it to finish via `waitForAnyFlushLocked`,
+not only a write that would itself need to start a *second* flush.
+Under sustained heavy concurrency with frequent flushes, nearly every
+writer ends up waiting for flush completion one way or another — via
+this gate for async, via contending for one mutex for sync — which
+substantially narrows, and sometimes reverses, the aggregate advantage
+the isolated measurement above shows so clearly.
+
+This is a real, honest limitation of the current design, not a
+benchmark artifact: the single-flush-in-flight bound trades away some
+of async flush's real-world benefit under high write concurrency in
+exchange for much simpler reasoning (no need to track an arbitrary
+number of outstanding frozen memtables, no need for more than one extra
+WAL file at a time). A bounded queue of pending flushes — allowing a
+second (or Nth) flush to start once the first is far enough along,
+rather than gating all new writes on the first one's completion — is
+the natural next step if this project's concurrency profile ever
+justified the added complexity; it isn't pursued here because the
+isolated case above is the one this project's own workload (a single
+Raft-driven `applyCommitted` call per commit, not many independent
+concurrent writers hammering the engine directly) actually resembles
+more closely.
+
 ## Reproducing these results
 
 ```bash

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/PedrowDias/key-value-store/wal"
@@ -355,19 +356,67 @@ func TestOpen_CorruptedExistingSSTablePropagatesError(t *testing.T) {
 	}
 }
 
-func TestOpen_CorruptedWALPropagatesError(t *testing.T) {
+// TestOpen_CorruptedWALIsGracefullyTruncatedNotAnError confirms that
+// wal.Replay's crash-safety contract (any corruption is treated as a
+// torn write from a crash mid-append, truncated gracefully, not a hard
+// error — see wal.Replay's own doc) is what Open actually observes: a
+// corrupted record doesn't fail recovery, it's silently discarded, same
+// as a real crash mid-write would produce. There is deliberately no
+// "corrupted WAL causes Open to return an error" test — that's not
+// achievable through the WAL format's own documented behavior; the
+// closest real error path recovery has is re-logging (see the test
+// below), which this project can and does test precisely.
+func TestOpen_CorruptedWALIsGracefullyTruncatedNotAnError(t *testing.T) {
 	dir := tempDir(t)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	e := mustOpen(t, Options{Dir: dir})
+	e.Put([]byte("k"), []byte("some-reasonably-long-value-to-corrupt-safely"))
+	e.Close()
+
+	walPath := filepath.Join(dir, "000000.wal")
+	f, err := os.OpenFile(walPath, os.O_WRONLY, 0644)
+	if err != nil {
 		t.Fatal(err)
 	}
-	// wal.log as a directory instead of a file: wal.Replay's os.OpenFile
-	// will fail with a non-IsNotExist error.
-	if err := os.Mkdir(filepath.Join(dir, walFileName), 0755); err != nil {
+	if _, err := f.WriteAt([]byte{0xFF}, 8); err != nil {
 		t.Fatal(err)
 	}
+	f.Close()
+
+	e2, err := Open(Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("expected Open to recover gracefully from a corrupted trailing record, got: %v", err)
+	}
+	defer e2.Close()
+	if _, found, _ := e2.Get([]byte("k")); found {
+		t.Fatal("expected the corrupted record to have been discarded, not recovered")
+	}
+}
+
+// TestOpen_RelogRecoveredRecordsErrorPropagates exercises the one real,
+// portably-triggerable failure path recovery has: after replaying
+// whatever WAL(s) were found, Open re-logs the recovered records into a
+// single fresh WAL before removing the old one(s) (see the package doc
+// for why). If that re-log write fails, Open must propagate the error
+// rather than silently proceeding with a state that's no longer safely
+// durable.
+func TestOpen_RelogRecoveredRecordsErrorPropagates(t *testing.T) {
+	dir := tempDir(t)
+	e := mustOpen(t, Options{Dir: dir})
+	e.Put([]byte("k"), []byte("v")) // leaves something for recovery to replay and re-log
+	e.Close()
+
+	orig := openWAL
+	openWAL = func(path string, opts wal.Options) (walHandle, error) {
+		return &fakeWALHandle{failAppend: true, path: path}, nil
+	}
+	defer func() { openWAL = orig }()
+
 	_, err := Open(Options{Dir: dir})
 	if err == nil {
-		t.Fatal("expected Open to propagate a wal.Replay error")
+		t.Fatal("expected Open to propagate a re-logging error")
+	}
+	if !strings.Contains(err.Error(), "re-logging recovered records") {
+		t.Fatalf("error = %v, want it to mention re-logging", err)
 	}
 }
 
@@ -496,6 +545,13 @@ func TestApplyBatch_TriggersAutoFlushOnce(t *testing.T) {
 	if err := e.ApplyBatch(ops); err != nil {
 		t.Fatal(err)
 	}
+	// The flush this batch triggers runs in the background; wait for it
+	// (Flush is a no-op once the active memtable is already empty, but
+	// still waits for any flush already in progress first) before
+	// checking NumSSTables.
+	if err := e.Flush(); err != nil {
+		t.Fatal(err)
+	}
 
 	if got := e.Stats().NumSSTables; got == 0 {
 		t.Fatal("expected the batch to have crossed the tiny threshold and triggered a flush")
@@ -552,7 +608,7 @@ func TestEngine_DeleteRecordTypeUsedCorrectly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	records, _, err := wal.Replay(filepath.Join(dir, walFileName))
+	records, _, err := wal.Replay(filepath.Join(dir, "000000.wal"))
 	if err != nil {
 		t.Fatal(err)
 	}

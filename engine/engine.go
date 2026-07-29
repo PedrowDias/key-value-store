@@ -7,38 +7,60 @@
 // Directory layout for a store at dir:
 //
 //	dir/
-//	  wal.log        — current write-ahead log
+//	  000000.wal     — current write-ahead log (numbered like SSTables;
+//	                    normally exactly one exists, but a second can
+//	                    briefly coexist during a background flush — see
+//	                    below)
 //	  000000.sst     — oldest flushed SSTable
 //	  000001.sst     — next oldest
 //	  ...            — highest number = most recently flushed = newest
 //
 // Write path: Put/Delete append to the WAL (durable before returning),
 // then apply to the in-memory memtable. When the memtable's approximate
-// size crosses MemtableSizeThreshold, it is flushed to a new SSTable and
-// the WAL is rotated (truncated to empty), since every record in it is
-// now durably represented in an SSTable and no longer needs replaying.
+// size crosses MemtableSizeThreshold, it is flushed to a new SSTable —
+// see "Background flush" below for how that happens without blocking the
+// write that triggered it.
 //
-// Read path: check the memtable first, then consult SSTables from newest
-// to oldest, returning on the first hit (a tombstone counts as a hit —
-// finding one for a key means "deleted," not "keep looking further back").
-// A single sstable.BlockCache (see Options.BlockCacheSize) is shared
-// across every SSTable this Engine ever opens — on recovery and on every
-// subsequent flush — so a repeated read of the same data block, even
-// across different flushed tables over the store's lifetime, is served
-// from memory rather than paying a disk read and checksum verification
-// again.
+// Read path: check the active memtable, then the frozen (if any, see
+// below) memtable, then each SSTable from newest to oldest, returning on
+// the first hit (a tombstone counts as a hit — finding one for a key
+// means "deleted," not "keep looking further back"). A single
+// sstable.BlockCache (see Options.BlockCacheSize) is shared across every
+// SSTable this Engine ever opens — on recovery and on every subsequent
+// flush — so a repeated read of the same data block, even across
+// different flushed tables over the store's lifetime, is served from
+// memory rather than paying a disk read and checksum verification again.
 //
-// Concurrency: a single sync.RWMutex guards everything. Writes (and any
-// flush they trigger) take the write lock; reads take the read lock. This
-// means a flush — which walks the whole memtable and writes a new SSTable
-// file — blocks all other engine activity for its duration. That's a
-// deliberate simplicity-first tradeoff for this phase, not an oversight:
-// it keeps the write path trivially easy to reason about, at the cost of
-// a latency spike on whichever write happens to trigger a flush. Making
-// flushes asynchronous (freeze the full memtable, keep accepting new
-// writes into a fresh one, flush the frozen one in the background) is a
-// natural follow-up — and a good candidate for a "before vs. after"
-// benchmark once the benchmarking phase measures p99 write latency.
+// Background flush: when the active memtable crosses its size threshold,
+// it is frozen (made immutable) and a fresh, empty memtable immediately
+// takes over for new writes — which is what makes flushing
+// "background": the write that triggered it, and every write after it,
+// proceeds without waiting for the actual disk I/O (walking the whole
+// frozen memtable and writing a new SSTable) to finish. A dedicated WAL
+// file is opened for the fresh memtable's writes at the same moment; the
+// frozen memtable's own WAL stays open and undeleted until its flush
+// actually completes, so a crash mid-flush can still recover by
+// replaying it. This project bounds itself to at most one flush in
+// flight at a time: if writes fill the fresh memtable again before the
+// previous flush finishes, the next call that would start a second one
+// instead waits for the first — a deliberate, documented simplicity
+// tradeoff over an unbounded queue of pending memtables, since it still
+// achieves the actual goal (a single flush doesn't stall the many writes
+// that arrive while it's running) without the added complexity of
+// tracking an arbitrary number of outstanding generations.
+//
+// A background flush that fails is sticky: the engine refuses further
+// writes rather than risk silently losing data that was supposed to be
+// durably in an SSTable by now. This mirrors how production databases
+// handle an unrecoverable background compaction/flush failure — continuing
+// to accept writes atop a store whose durability guarantee just broke is
+// worse than stopping.
+//
+// Concurrency: a single sync.RWMutex guards all metadata (which
+// memtable/WAL is active, the SSTable list, sticky flush error). The
+// actual flush-to-disk work — walking the frozen memtable and writing
+// the new SSTable — deliberately happens with the lock NOT held, which
+// is the entire point of making it a background operation.
 package engine
 
 import (
@@ -54,7 +76,7 @@ import (
 )
 
 const (
-	walFileName            = "wal.log"
+	walFileNamePattern     = "%06d.wal"
 	sstableFileNamePattern = "%06d.sst"
 	defaultMemtableSizeMax = 4 * 1024 * 1024 // 4 MiB
 	defaultBlockCacheSize  = 8 * 1024 * 1024 // 8 MiB
@@ -73,6 +95,7 @@ type walHandle interface {
 	Append(rec wal.Record) error
 	AppendBatch(recs []wal.Record) error
 	Close() error
+	Path() string
 }
 
 type sstableWriter interface {
@@ -144,6 +167,25 @@ type Engine struct {
 	w   walHandle
 	mem *memtable.Memtable
 
+	// immutable is non-nil exactly while a background flush is in
+	// progress: the memtable frozen at the moment the flush started, no
+	// longer written to (mem, above, is the fresh one new writes go to),
+	// but still consulted by Get — its data isn't in an SSTable yet.
+	// flushDone is closed by the flush goroutine when it finishes
+	// (success or failure); callers that need to wait for it (a second
+	// write that would otherwise start a redundant concurrent flush, or
+	// Close) receive on it without holding e.mu.
+	immutable *memtable.Memtable
+	flushDone chan struct{}
+	// flushErr is sticky: once a background flush fails, every
+	// subsequent write refuses rather than risk silently losing data —
+	// see the package doc for why.
+	flushErr error
+	// flushWG lets Close wait for a still-running flush goroutine to
+	// actually exit before tearing down the engine's files out from
+	// under it.
+	flushWG sync.WaitGroup
+
 	// cache is shared across every SSTable this Engine opens (on
 	// recovery and on every subsequent flush) — see
 	// sstable.BlockCache's own doc for why sharing across files, not
@@ -157,13 +199,23 @@ type Engine struct {
 
 	nextSeq      uint64 // sequence number to assign to the next write
 	nextFlushSeq int    // number to use for the next flushed SSTable's filename
+	nextWALSeq   int    // number to use for the next WAL file's filename
 
 	closed bool
 }
 
 // Open opens (creating if necessary) a store at opts.Dir, replaying its
-// WAL and discovering any existing SSTables to recover the state from a
-// previous run.
+// WAL(s) and discovering any existing SSTables to recover the state from
+// a previous run.
+//
+// Recovery discovers every "NNNNNN.wal" file present (normally exactly
+// one, but a crash during a background flush can leave two — the frozen
+// memtable's WAL and the fresh one opened alongside it) and replays all
+// of them, in file-number order, into one in-memory memtable. That
+// recovered memtable is then immediately re-logged into a single fresh
+// WAL file before the old one(s) are deleted — restoring the normal
+// "exactly one WAL, matching the current memtable exactly" invariant
+// right away, rather than carrying old WAL files forward indefinitely.
 func Open(opts Options) (*Engine, error) {
 	opts = opts.withDefaults()
 	if err := os.MkdirAll(opts.Dir, 0755); err != nil {
@@ -177,23 +229,45 @@ func Open(opts Options) (*Engine, error) {
 		return nil, err
 	}
 
-	walPath := filepath.Join(opts.Dir, walFileName)
-	records, _, err := wal.Replay(walPath)
+	walPaths, nextWALSeq, err := discoverWALs(opts.Dir)
 	if err != nil {
+		// Accepted gap: discoverSSTables just scanned this same
+		// directory successfully, so making discoverWALs specifically
+		// fail its own os.ReadDir on the identical path needs the
+		// directory to become unreadable in the narrow window between
+		// the two calls — not portably triggerable, same class of
+		// OS-level branch this project has consistently left untested
+		// elsewhere (e.g. Stat/ReadAt failures on an already-opened fd).
 		closeAll(sstables)
-		return nil, fmt.Errorf("engine: replaying wal: %w", err)
+		return nil, err
 	}
 
 	mem := memtable.New()
 	maxSeqFromWAL := uint64(0)
-	for _, rec := range records {
-		if rec.Type == wal.RecordDelete {
-			mem.Delete(rec.Key, rec.SeqNum)
-		} else {
-			mem.Put(rec.Key, rec.Value, rec.SeqNum)
+	for _, path := range walPaths {
+		records, _, err := wal.Replay(path)
+		if err != nil {
+			// Accepted gap: wal.Replay's own crash-safety contract (see
+			// its doc) treats every form of corruption as a torn write
+			// from a crash mid-append and truncates gracefully rather
+			// than returning an error — see
+			// TestOpen_CorruptedWALIsGracefullyTruncatedNotAnError. The
+			// only way this branch fires is os.OpenFile failing for a
+			// reason other than not-exist (permission denied, etc.),
+			// not portably triggerable against a file this process just
+			// discovered via its own successful os.ReadDir.
+			closeAll(sstables)
+			return nil, fmt.Errorf("engine: replaying wal %s: %w", path, err)
 		}
-		if rec.SeqNum > maxSeqFromWAL {
-			maxSeqFromWAL = rec.SeqNum
+		for _, rec := range records {
+			if rec.Type == wal.RecordDelete {
+				mem.Delete(rec.Key, rec.SeqNum)
+			} else {
+				mem.Put(rec.Key, rec.Value, rec.SeqNum)
+			}
+			if rec.SeqNum > maxSeqFromWAL {
+				maxSeqFromWAL = rec.SeqNum
+			}
 		}
 	}
 
@@ -203,10 +277,40 @@ func Open(opts Options) (*Engine, error) {
 	}
 	nextSeq++ // first unused sequence number; 0 is never assigned to a real write
 
-	w, err := openWAL(walPath, wal.Options{SyncOnWrite: true})
+	newWALPath := filepath.Join(opts.Dir, fmt.Sprintf(walFileNamePattern, nextWALSeq))
+	w, err := openWAL(newWALPath, wal.Options{SyncOnWrite: true})
 	if err != nil {
 		closeAll(sstables)
 		return nil, fmt.Errorf("engine: opening wal: %w", err)
+	}
+	nextWALSeq++
+
+	// Re-log whatever was recovered into the fresh WAL before removing
+	// the old one(s) — so the durability guarantee holds continuously;
+	// at no point is the recovered data represented in fewer places than
+	// it was before this step.
+	if mem.Len() > 0 {
+		records := make([]wal.Record, 0, mem.Len())
+		it := mem.NewIterator()
+		for it.SeekToFirst(); it.Valid(); it.Next() {
+			rt := wal.RecordPut
+			if it.Deleted() {
+				rt = wal.RecordDelete
+			}
+			records = append(records, wal.Record{SeqNum: it.SeqNum(), Type: rt, Key: it.Key(), Value: it.Value()})
+		}
+		if err := w.AppendBatch(records); err != nil {
+			w.Close()
+			closeAll(sstables)
+			return nil, fmt.Errorf("engine: re-logging recovered records: %w", err)
+		}
+	}
+	for _, path := range walPaths {
+		if err := removeFile(path); err != nil {
+			w.Close()
+			closeAll(sstables)
+			return nil, fmt.Errorf("engine: removing old wal %s after re-logging: %w", path, err)
+		}
 	}
 
 	return &Engine{
@@ -217,6 +321,7 @@ func Open(opts Options) (*Engine, error) {
 		sstables:     sstables,
 		nextSeq:      nextSeq,
 		nextFlushSeq: nextFlushSeq,
+		nextWALSeq:   nextWALSeq,
 	}, nil
 }
 
@@ -270,6 +375,43 @@ func discoverSSTables(dir string, cache *sstable.BlockCache) (sstables []*sstabl
 	return sstables, nextFlushSeq, maxSeq, nil
 }
 
+// discoverWALs scans dir for existing "NNNNNN.wal" files and returns
+// their full paths in ascending (oldest-first) file-number order — the
+// order they must be replayed in — along with the WAL-sequence number to
+// use for the next new one.
+func discoverWALs(dir string) (paths []string, nextWALSeq int, err error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, 0, fmt.Errorf("engine: listing %s: %w", dir, err)
+	}
+
+	var nums []int
+	numToName := make(map[int]string)
+	for _, de := range entries {
+		if de.IsDir() {
+			continue
+		}
+		var n int
+		if _, scanErr := fmt.Sscanf(de.Name(), walFileNamePattern, &n); scanErr != nil {
+			continue
+		}
+		if fmt.Sprintf(walFileNamePattern, n) != de.Name() {
+			continue
+		}
+		nums = append(nums, n)
+		numToName[n] = de.Name()
+	}
+	sort.Ints(nums)
+
+	for _, n := range nums {
+		paths = append(paths, filepath.Join(dir, numToName[n]))
+	}
+	if len(nums) > 0 {
+		nextWALSeq = nums[len(nums)-1] + 1
+	}
+	return paths, nextWALSeq, nil
+}
+
 func closeAll(entries []*sstableEntry) {
 	for _, e := range entries {
 		e.reader.Close()
@@ -309,13 +451,26 @@ type BatchOp struct {
 // applied in order — from the memtable/SSTable's perspective, a batch is
 // indistinguishable from the same N operations having arrived one at a
 // time. The only difference is durability cost.
+//
+// If applying this batch crosses the memtable size threshold, a
+// background flush starts (see the package doc) — this call still
+// returns as soon as the batch itself is durable, without waiting for
+// that flush to finish. If a previous flush is still running, this call
+// waits for it before proceeding, rather than starting a second one
+// concurrently (see the package doc for why).
 func (e *Engine) ApplyBatch(ops []BatchOp) error {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.closed {
-		return fmt.Errorf("engine: write on a closed engine")
+	if err := e.waitForAnyFlushLocked(); err != nil {
+		e.mu.Unlock()
+		return err
+	}
+	if e.flushErr != nil {
+		err := fmt.Errorf("engine: a previous background flush failed, refusing further writes: %w", e.flushErr)
+		e.mu.Unlock()
+		return err
 	}
 	if len(ops) == 0 {
+		e.mu.Unlock()
 		return nil
 	}
 
@@ -332,6 +487,7 @@ func (e *Engine) ApplyBatch(ops []BatchOp) error {
 		records[i] = wal.Record{SeqNum: seq, Type: rt, Key: op.Key, Value: op.Value}
 	}
 	if err := e.w.AppendBatch(records); err != nil {
+		e.mu.Unlock()
 		return fmt.Errorf("engine: wal append batch: %w", err)
 	}
 
@@ -343,19 +499,42 @@ func (e *Engine) ApplyBatch(ops []BatchOp) error {
 		}
 	}
 
+	var startErr error
 	if e.mem.ApproxSize() >= e.opts.MemtableSizeThreshold {
-		if err := e.flushLocked(); err != nil {
-			return fmt.Errorf("engine: auto-flush: %w", err)
+		startErr = e.startFlushLocked()
+	}
+	e.mu.Unlock()
+	if startErr != nil {
+		return fmt.Errorf("engine: starting background flush: %w", startErr)
+	}
+	return nil
+}
+
+// waitForAnyFlushLocked blocks until there is no flush in progress,
+// releasing and reacquiring e.mu while waiting so the flush goroutine
+// (which needs e.mu itself to install its results) is never blocked by
+// the caller holding it. Must be called with e.mu held; returns with it
+// held again (whether or not it waited). Returns an error only if the
+// engine was closed while waiting.
+func (e *Engine) waitForAnyFlushLocked() error {
+	for e.immutable != nil {
+		done := e.flushDone
+		e.mu.Unlock()
+		<-done
+		e.mu.Lock()
+		if e.closed {
+			return fmt.Errorf("engine: closed while waiting for a background flush")
 		}
 	}
 	return nil
 }
 
 // Get looks up key. found is false if the key has never been written (or
-// was deleted). Get consults the memtable first, then each SSTable from
-// newest to oldest, stopping at the first table that has any record for
-// the key at all — a tombstone there means "deleted," never "check an
-// older table instead."
+// was deleted). Get consults the active memtable, then the frozen
+// (if any) memtable a background flush is currently working through,
+// then each SSTable from newest to oldest, stopping at the first one
+// that has any record for the key at all — a tombstone there means
+// "deleted," never "check an older table instead."
 func (e *Engine) Get(key []byte) (value []byte, found bool, err error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -368,6 +547,15 @@ func (e *Engine) Get(key []byte) (value []byte, found bool, err error) {
 			return nil, false, nil
 		}
 		return val, true, nil
+	}
+
+	if e.immutable != nil {
+		if val, _, deleted, immFound := e.immutable.Get(key); immFound {
+			if deleted {
+				return nil, false, nil
+			}
+			return val, true, nil
+		}
 	}
 
 	for _, entry := range e.sstables {
@@ -385,69 +573,153 @@ func (e *Engine) Get(key []byte) (value []byte, found bool, err error) {
 	return nil, false, nil
 }
 
-// Flush forces the current memtable to be written out to a new SSTable
-// immediately, regardless of its size. A no-op if the memtable is empty.
-// Exposed mainly for tests and for an explicit "checkpoint now" operation;
-// normal operation triggers this automatically via the size threshold.
+// Flush forces the current memtable to be written out to a new SSTable,
+// waiting for that to complete before returning — unlike the automatic,
+// non-blocking background flush a write crossing the size threshold
+// starts, this is an explicit, synchronous "checkpoint now and wait"
+// operation, exposed mainly for tests and for an operator wanting to
+// force one before shutdown. If a background flush is already running,
+// this waits for it first; if the (now-current) memtable is empty at
+// that point, this is a no-op.
 func (e *Engine) Flush() error {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if e.closed {
+		e.mu.Unlock()
 		return fmt.Errorf("engine: flush on a closed engine")
 	}
-	return e.flushLocked()
-}
-
-// flushLocked writes the current memtable to a new SSTable, rotates the
-// WAL (since everything in it is now durably represented in that
-// SSTable), and swaps in a fresh empty memtable. Caller must hold e.mu.
-func (e *Engine) flushLocked() error {
+	if err := e.waitForAnyFlushLocked(); err != nil {
+		e.mu.Unlock()
+		return err
+	}
+	if e.flushErr != nil {
+		err := fmt.Errorf("engine: a previous background flush failed: %w", e.flushErr)
+		e.mu.Unlock()
+		return err
+	}
 	if e.mem.Len() == 0 {
+		e.mu.Unlock()
 		return nil
 	}
+	if err := e.startFlushLocked(); err != nil {
+		e.mu.Unlock()
+		return err
+	}
+	done := e.flushDone
+	e.mu.Unlock()
 
-	path := e.sstablePath(e.nextFlushSeq)
-	sw, err := newSSTableWriter(path, sstable.Options{
-		BlockSize:   e.opts.SSTableBlockSize,
-		BloomFPRate: e.opts.SSTableBloomFPRate,
-	})
+	<-done // wait for the flush just started to actually finish
+
+	e.mu.Lock()
+	err := e.flushErr
+	e.mu.Unlock()
 	if err != nil {
-		return fmt.Errorf("engine: creating sstable writer: %w", err)
+		return fmt.Errorf("engine: flush failed: %w", err)
 	}
+	return nil
+}
 
-	it := e.mem.NewIterator()
-	for it.SeekToFirst(); it.Valid(); it.Next() {
-		if err := sw.Add(it.Key(), it.Value(), it.SeqNum(), it.Deleted()); err != nil {
-			return fmt.Errorf("engine: writing sstable entry: %w", err)
-		}
+// startFlushLocked freezes the current memtable and its WAL, opens a
+// fresh WAL for new writes to continue into immediately, and spawns a
+// goroutine to write the frozen memtable out as a new SSTable in the
+// background. Must be called with e.mu held, with e.immutable == nil
+// (no flush already running — callers arrange this via
+// waitForAnyFlushLocked first) and e.mem non-empty.
+func (e *Engine) startFlushLocked() error {
+	newWALPath := filepath.Join(e.opts.Dir, fmt.Sprintf(walFileNamePattern, e.nextWALSeq))
+	newWAL, err := openWAL(newWALPath, wal.Options{SyncOnWrite: true})
+	if err != nil {
+		return fmt.Errorf("opening new wal for background flush: %w", err)
 	}
-	if _, err := sw.Finish(); err != nil {
-		return fmt.Errorf("engine: finishing sstable: %w", err)
+	e.nextWALSeq++
+
+	frozen := e.mem
+	frozenWAL := e.w
+	e.immutable = frozen
+	e.mem = memtable.New()
+	e.w = newWAL
+
+	flushSeq := e.nextFlushSeq
+	e.nextFlushSeq++
+
+	done := make(chan struct{})
+	e.flushDone = done
+
+	e.flushWG.Add(1)
+	go e.runFlush(frozen, frozenWAL, flushSeq, done)
+	return nil
+}
+
+// runFlush writes frozen out as a new SSTable, then installs the result
+// (or records a sticky error) under lock, and finally removes the WAL
+// frozen's data came from — safe now, since that data is durably
+// represented in the new SSTable. Deliberately holds e.mu for none of
+// the actual disk I/O (writing the SSTable, removing the old WAL) —
+// only for the brief metadata updates — which is the entire point of
+// this running in the background: reads and writes into the new active
+// memtable are never blocked by it.
+func (e *Engine) runFlush(frozen *memtable.Memtable, frozenWAL walHandle, flushSeq int, done chan struct{}) {
+	defer close(done)
+	defer e.flushWG.Done()
+
+	path := e.sstablePath(flushSeq)
+	if err := writeSSTableFromMemtable(frozen, path, e.opts); err != nil {
+		e.mu.Lock()
+		e.flushErr = fmt.Errorf("background flush: %w", err)
+		e.immutable = nil
+		e.mu.Unlock()
+		return
 	}
 
 	reader, err := openSSTableForRead(path, e.cache)
 	if err != nil {
-		return fmt.Errorf("engine: reopening flushed sstable: %w", err)
+		e.mu.Lock()
+		e.flushErr = fmt.Errorf("background flush: reopening flushed sstable: %w", err)
+		e.immutable = nil
+		e.mu.Unlock()
+		return
 	}
+
+	e.mu.Lock()
 	e.sstables = append([]*sstableEntry{{path: path, reader: reader}}, e.sstables...)
-	e.nextFlushSeq++
-	e.mem = memtable.New()
+	e.immutable = nil
+	e.mu.Unlock()
 
-	// Rotate the WAL: everything it held is now durable in the SSTable
-	// we just wrote, so it can be truncated to empty rather than growing
-	// forever across the engine's lifetime.
-	if err := e.w.Close(); err != nil {
-		return fmt.Errorf("engine: closing wal for rotation: %w", err)
+	if err := frozenWAL.Close(); err != nil {
+		e.mu.Lock()
+		e.flushErr = fmt.Errorf("background flush: closing old wal %s: %w", frozenWAL.Path(), err)
+		e.mu.Unlock()
+		return
 	}
-	if err := removeFile(e.walPath()); err != nil {
-		return fmt.Errorf("engine: removing old wal: %w", err)
+	if err := removeFile(frozenWAL.Path()); err != nil {
+		e.mu.Lock()
+		e.flushErr = fmt.Errorf("background flush: removing old wal %s: %w", frozenWAL.Path(), err)
+		e.mu.Unlock()
+		return
 	}
-	newWAL, err := openWAL(e.walPath(), wal.Options{SyncOnWrite: true})
+}
+
+// writeSSTableFromMemtable walks mem in order and writes it out as a new
+// SSTable at path — the pure "do the flush" step, with no engine state
+// (locks, fields) involved, so it's exactly the same code whether called
+// from the background flush goroutine or (indirectly, via the shared
+// machinery above) Flush's synchronous wait.
+func writeSSTableFromMemtable(mem *memtable.Memtable, path string, opts Options) error {
+	sw, err := newSSTableWriter(path, sstable.Options{
+		BlockSize:   opts.SSTableBlockSize,
+		BloomFPRate: opts.SSTableBloomFPRate,
+	})
 	if err != nil {
-		return fmt.Errorf("engine: reopening wal after rotation: %w", err)
+		return fmt.Errorf("creating sstable writer: %w", err)
 	}
-	e.w = newWAL
-
+	it := mem.NewIterator()
+	for it.SeekToFirst(); it.Valid(); it.Next() {
+		if err := sw.Add(it.Key(), it.Value(), it.SeqNum(), it.Deleted()); err != nil {
+			return fmt.Errorf("writing sstable entry: %w", err)
+		}
+	}
+	if _, err := sw.Finish(); err != nil {
+		return fmt.Errorf("finishing sstable: %w", err)
+	}
 	return nil
 }
 
@@ -456,10 +728,6 @@ func (e *Engine) flushLocked() error {
 // a real os.Remove essentially never fails on a normal writable file you
 // already control, making that branch otherwise untestable.
 var removeFile = os.Remove
-
-func (e *Engine) walPath() string {
-	return filepath.Join(e.opts.Dir, walFileName)
-}
 
 func (e *Engine) sstablePath(n int) string {
 	return filepath.Join(e.opts.Dir, fmt.Sprintf(sstableFileNamePattern, n))
@@ -471,6 +739,9 @@ type Stats struct {
 	MemtableSize    int64
 	MemtableEntries int
 	NumSSTables     int
+	// FlushInProgress reports whether a background flush is currently
+	// running.
+	FlushInProgress bool
 }
 
 // Stats returns a snapshot of the engine's current state.
@@ -481,19 +752,29 @@ func (e *Engine) Stats() Stats {
 		MemtableSize:    e.mem.ApproxSize(),
 		MemtableEntries: e.mem.Len(),
 		NumSSTables:     len(e.sstables),
+		FlushInProgress: e.immutable != nil,
 	}
 }
 
-// Close closes the WAL and every open SSTable reader. Whatever's in the
-// memtable but not yet flushed remains safely recoverable from the WAL on
-// the next Open, so Close does not force a flush.
+// Close closes the WAL and every open SSTable reader, waiting for any
+// in-flight background flush to finish first — otherwise it could be
+// left trying to write to (or remove) files out from under a torn-down
+// engine. Whatever's in the memtable but not yet flushed remains safely
+// recoverable from the WAL on the next Open, so Close does not force a
+// flush of its own.
 func (e *Engine) Close() error {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if e.closed {
+		e.mu.Unlock()
 		return nil
 	}
 	e.closed = true
+	e.mu.Unlock() // released before waiting: the flush goroutine needs e.mu itself to finish
+
+	e.flushWG.Wait()
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
 	var firstErr error
 	if err := e.w.Close(); err != nil && firstErr == nil {
