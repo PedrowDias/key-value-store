@@ -47,6 +47,14 @@ type loadTestNode struct {
 }
 
 func startLoadTestCluster(t *testing.T, n int, raftBasePort, httpBasePort int) []*loadTestNode {
+	return startLoadTestClusterWithBatchWindow(t, n, raftBasePort, httpBasePort, -1)
+}
+
+// startLoadTestClusterWithBatchWindow is startLoadTestCluster with
+// control over the group-commit batch window; batchWindow < 0 leaves
+// each Server's own default in place. Used by TestBatchWindowSweep to
+// stand up a cluster per candidate window value.
+func startLoadTestClusterWithBatchWindow(t *testing.T, n int, raftBasePort, httpBasePort int, batchWindow time.Duration) []*loadTestNode {
 	t.Helper()
 	ids := make([]uint64, n)
 	raftAddrs := make(map[uint64]string, n)
@@ -84,6 +92,9 @@ func startLoadTestCluster(t *testing.T, n int, raftBasePort, httpBasePort int) [
 		}
 
 		srv := server.New(rn, tr, eng, loadTestTickInterval)
+		if batchWindow >= 0 {
+			srv.SetBatchWindow(batchWindow)
+		}
 		go srv.Run()
 
 		httpLn, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", httpBasePort+i))
@@ -288,6 +299,33 @@ func runLoadTest(t *testing.T, client *loadTestClient, numWorkers, requestsPerWo
 	return computeLatencyStats(allLatencies, int(errorCount), wallClock)
 }
 
+// newLoadTestHTTPClient builds an http.Client configured for the
+// concurrency these load tests actually generate.
+//
+// Go's http.DefaultTransport (what an &http.Client{Timeout: ...} with no
+// Transport field gets, implicitly) caps MaxIdleConnsPerHost at just 2.
+// With dozens of concurrent goroutines all sending requests to the same
+// leader URL, that's a severe, unintentional bottleneck baked into the
+// BENCHMARK TOOL itself: most requests can't reuse a pooled connection
+// and pay a full TCP handshake, or queue behind the tiny pool — entirely
+// separate from anything the server under test is actually doing. This
+// was discovered, not designed around from the start: an early version
+// of this file used the zero-value client, and a batch-window sweep at
+// 50 concurrent workers produced results that didn't make sense (0
+// window performing far worse than even a no-batching baseline) until
+// tracing it back to this.
+func newLoadTestHTTPClient(maxConns int) *http.Client {
+	return &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        maxConns,
+			MaxIdleConnsPerHost: maxConns,
+			MaxConnsPerHost:     0, // unlimited — let the OS/kernel be the real limit, not this client
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
+}
+
 func TestClusterThroughputAndLatency(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping cluster load test in -short mode")
@@ -302,7 +340,7 @@ func TestClusterThroughputAndLatency(t *testing.T) {
 		readURLs = append(readURLs, n.httpURL)
 	}
 	client := &loadTestClient{
-		http:     &http.Client{Timeout: 5 * time.Second},
+		http:     newLoadTestHTTPClient(128),
 		writeURL: leader.httpURL,
 		readURLs: readURLs,
 	}
@@ -329,4 +367,57 @@ func TestClusterThroughputAndLatency(t *testing.T) {
 		stats := runLoadTest(t, client, 100, 20, 10, keySpace)
 		stats.log(t, "Write-heavy (10% reads), 100 workers x 20 requests")
 	})
+}
+
+// TestBatchWindowSweep empirically finds a good group-commit batch
+// window rather than assuming the package default is optimal: it stands
+// up a fresh cluster per candidate window (so one run's warm state can't
+// bias the next), applies the same write-heavy workload at a fixed
+// concurrency, and reports throughput/latency for each. Run with:
+//
+//	go test ./bench/... -run TestBatchWindowSweep -v
+func TestBatchWindowSweep(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping batch window sweep in -short mode")
+	}
+
+	windows := []time.Duration{
+		0,
+		100 * time.Microsecond,
+		250 * time.Microsecond,
+		500 * time.Microsecond,
+		1 * time.Millisecond,
+		2 * time.Millisecond,
+		5 * time.Millisecond,
+	}
+
+	for i, window := range windows {
+		window := window
+		t.Run(window.String(), func(t *testing.T) {
+			basePort := 26500 + i*10
+			nodes := startLoadTestClusterWithBatchWindow(t, 3, basePort, basePort+100, window)
+			defer stopLoadTestCluster(nodes)
+
+			leader := waitForLoadTestLeader(t, nodes, 3*time.Second)
+			var readURLs []string
+			for _, n := range nodes {
+				readURLs = append(readURLs, n.httpURL)
+			}
+			client := &loadTestClient{
+				http:     newLoadTestHTTPClient(128),
+				writeURL: leader.httpURL,
+				readURLs: readURLs,
+			}
+
+			const keySpace = 200
+			for k := 0; k < keySpace; k++ {
+				if _, err := client.put([]byte(fmt.Sprintf("k-%d", k)), []byte("v")); err != nil {
+					t.Fatalf("populate: %v", err)
+				}
+			}
+
+			stats := runLoadTest(t, client, 50, 30, 10, keySpace)
+			stats.log(t, fmt.Sprintf("batchWindow=%s, write-heavy, 50 workers x 30 requests", window))
+		})
+	}
 }

@@ -2,7 +2,9 @@ package server
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -289,40 +291,82 @@ func TestApplyCommitted_NoOpWhenAlreadyUpToDate(t *testing.T) {
 
 // --- drainAndAcceptProposals (group commit batching) ------------------------
 
-func TestDrainAndAcceptProposals_BatchesAllWaitingRequests(t *testing.T) {
+func TestSubmitBatch_ProposesAllAndRegistersWaiters(t *testing.T) {
 	fake := newFakeRaftNode()
 	srv := New(fake, newTestTransport(t), newTestEngine(t), time.Millisecond)
 
-	// Pre-load two additional requests directly into the buffered
-	// channel (simulating concurrent callers already waiting), then
-	// call the drain method with a third as if Run() had just received
-	// it — deterministic, no goroutine-scheduling timing required.
-	req2 := proposeRequest{data: []byte("second"), resultCh: make(chan applyResult, 1)}
-	req3 := proposeRequest{data: []byte("third"), resultCh: make(chan applyResult, 1)}
-	srv.proposeCh <- req2
-	srv.proposeCh <- req3
-
-	req1 := proposeRequest{data: []byte("first"), resultCh: make(chan applyResult, 1)}
-	srv.drainAndAcceptProposals(req1)
+	reqs := []proposeRequest{
+		{data: []byte("first"), resultCh: make(chan applyResult, 1)},
+		{data: []byte("second"), resultCh: make(chan applyResult, 1)},
+		{data: []byte("third"), resultCh: make(chan applyResult, 1)},
+	}
+	srv.submitBatch(reqs)
 
 	if len(fake.proposedData) != 3 {
-		t.Fatalf("proposedData = %v, want 3 entries (all three requests batched together)", fake.proposedData)
+		t.Fatalf("proposedData = %v, want 3 entries (all three submitted together)", fake.proposedData)
 	}
 	if len(srv.waiters) != 3 {
 		t.Fatalf("waiters = %d, want 3", len(srv.waiters))
 	}
 }
 
-func TestDrainAndAcceptProposals_StopsWhenChannelEmpty(t *testing.T) {
+func TestSubmitBatch_EmptyIsNoop(t *testing.T) {
 	fake := newFakeRaftNode()
 	srv := New(fake, newTestTransport(t), newTestEngine(t), time.Millisecond)
-
-	req := proposeRequest{data: []byte("only"), resultCh: make(chan applyResult, 1)}
-	srv.drainAndAcceptProposals(req)
-
-	if len(fake.proposedData) != 1 {
-		t.Fatalf("proposedData = %v, want exactly 1 (nothing else was waiting)", fake.proposedData)
+	srv.submitBatch(nil)
+	if len(fake.proposedData) != 0 {
+		t.Fatalf("proposedData = %v, want empty", fake.proposedData)
 	}
+}
+
+func TestSubmitBatch_ProposeErrorNotifiesEveryWaiterInTheBatch(t *testing.T) {
+	fake := newFakeRaftNode()
+	fake.proposeErr = errors.New("boom")
+	srv := New(fake, newTestTransport(t), newTestEngine(t), time.Millisecond)
+
+	reqs := []proposeRequest{
+		{data: []byte("a"), resultCh: make(chan applyResult, 1)},
+		{data: []byte("b"), resultCh: make(chan applyResult, 1)},
+	}
+	srv.submitBatch(reqs)
+
+	for i, r := range reqs {
+		select {
+		case res := <-r.resultCh:
+			if res.err == nil {
+				t.Fatalf("request %d: expected an error", i)
+			}
+		default:
+			t.Fatalf("request %d: expected to be notified", i)
+		}
+	}
+	if len(srv.waiters) != 0 {
+		t.Fatalf("waiters = %d, want 0 (nothing should be registered on a failed batch)", len(srv.waiters))
+	}
+}
+
+func TestFailPending_NotifiesEveryRequest(t *testing.T) {
+	srv := New(newFakeRaftNode(), newTestTransport(t), newTestEngine(t), time.Millisecond)
+	reqs := []proposeRequest{
+		{data: []byte("a"), resultCh: make(chan applyResult, 1)},
+		{data: []byte("b"), resultCh: make(chan applyResult, 1)},
+	}
+	srv.failPending(reqs, errors.New("server: stopped"))
+	for i, r := range reqs {
+		select {
+		case res := <-r.resultCh:
+			if res.err == nil {
+				t.Fatalf("request %d: expected an error", i)
+			}
+		default:
+			t.Fatalf("request %d: expected to be notified", i)
+		}
+	}
+}
+
+func TestFailPending_EmptyIsNoop(t *testing.T) {
+	srv := New(newFakeRaftNode(), newTestTransport(t), newTestEngine(t), time.Millisecond)
+	srv.failPending(nil, errors.New("x")) // must not panic on an empty slice
 }
 
 // --- applyEntry's branches ---------------------------------------------------
@@ -462,5 +506,108 @@ func TestRun_ExitsWhenTransportRecvChannelCloses(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not exit after its transport's Recv channel closed")
+	}
+}
+
+// --- The batching window: timer, max-batch-size, and shutdown behavior -----
+
+func TestRun_BatchWindowTimerFlushesASingleProposal(t *testing.T) {
+	fake := newFakeRaftNode()
+	fake.autoCommit = true
+	srv := New(fake, newTestTransport(t), newTestEngine(t), time.Hour)
+	srv.SetBatchWindow(5 * time.Millisecond)
+	go srv.Run()
+	defer srv.Stop()
+
+	// Nothing else is proposed alongside this one: the only way it can
+	// ever get applied is via the timer firing on its own, since it'll
+	// never reach maxBatchSize with just one item.
+	if err := srv.Put([]byte("k"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	val, found, err := srv.Get([]byte("k"))
+	if err != nil || !found || string(val) != "v" {
+		t.Fatalf("Get(k) = %q found=%v err=%v", val, found, err)
+	}
+}
+
+func TestRun_ZeroBatchWindowSubmitsWithoutWaiting(t *testing.T) {
+	fake := newFakeRaftNode()
+	fake.autoCommit = true
+	srv := New(fake, newTestTransport(t), newTestEngine(t), time.Hour)
+	srv.SetBatchWindow(0) // disabled: submit as soon as Run notices a proposal
+	go srv.Run()
+	defer srv.Stop()
+
+	start := time.Now()
+	if err := srv.Put([]byte("k"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	// Not a precise timing assertion (inherently flaky) — just confirms
+	// this didn't wait anywhere near a "real" window would take, i.e.
+	// the zero-window path actually is a distinct, faster code path.
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("Put took %v with a zero batch window; expected near-immediate submission", elapsed)
+	}
+}
+
+func TestRun_MaxBatchSizeFlushesBeforeTheWindowElapses(t *testing.T) {
+	fake := newFakeRaftNode()
+	fake.autoCommit = true
+	srv := New(fake, newTestTransport(t), newTestEngine(t), time.Hour)
+	srv.SetBatchWindow(time.Hour) // would never fire on its own within this test
+	srv.SetMaxBatchSize(3)
+	go srv.Run()
+	defer srv.Stop()
+
+	// Fire off 3 concurrent Puts — exactly maxBatchSize — and confirm
+	// they all complete quickly. If max-batch-size flushing didn't
+	// work, this would hang until the (hour-long) timer, which the
+	// test's own timeout below would catch.
+	var wg sync.WaitGroup
+	errs := make([]error, 3)
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = srv.Put([]byte(fmt.Sprintf("k%d", i)), []byte("v"))
+		}(i)
+	}
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Puts did not complete promptly; max-batch-size early flush did not trigger")
+	}
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+	}
+}
+
+func TestRun_StopWithPendingProposalFailsItImmediately(t *testing.T) {
+	fake := newFakeRaftNode()
+	srv := New(fake, newTestTransport(t), newTestEngine(t), time.Hour)
+	srv.SetBatchWindow(time.Hour) // ensure the proposal is still sitting in `pending`, unsubmitted, when Stop is called
+	go srv.Run()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.Put([]byte("k"), []byte("v")) }()
+
+	// Give the proposal time to actually be received into Run's pending
+	// slice before stopping.
+	time.Sleep(50 * time.Millisecond)
+	srv.Stop()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected an error: the server stopped before this proposal was ever submitted to Raft")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Put did not return promptly after Stop; failPending did not fire for the still-pending proposal")
 	}
 }

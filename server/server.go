@@ -79,6 +79,27 @@ type Server struct {
 
 	tickInterval time.Duration
 
+	// batchWindow is how long Run waits, after the first proposal in an
+	// otherwise-idle moment arrives, for more proposals to accumulate
+	// before submitting them together via one ProposeBatch call — the
+	// standard "group commit" / "linger" tuning knob (the same idea as
+	// Kafka's linger.ms or CockroachDB's proposal batching). A batch
+	// still flushes early, without waiting out the full window, once it
+	// reaches maxBatchSize. Zero disables waiting entirely: every
+	// proposal is submitted as soon as Run notices it, individually
+	// unless others happen to already be queued in the same instant.
+	//
+	// This exists because of a real, measured finding, not a guess:
+	// batching client writes together only helps throughput if enough
+	// of them are actually queued up at the moment a batch gets
+	// submitted, and on fast hardware individual writes can complete
+	// quickly enough that a purely opportunistic (never-wait) drain
+	// doesn't reliably accumulate more than one or two — see
+	// bench/BENCHMARKS.md's real-hardware section for the measurement
+	// that motivated this.
+	batchWindow  time.Duration
+	maxBatchSize int
+
 	proposeCh chan proposeRequest
 	stopCh    chan struct{}
 	stopOnce  sync.Once
@@ -103,14 +124,19 @@ type Server struct {
 }
 
 // proposeChBufferSize bounds how many pending Put/Delete calls can be
-// queued waiting for Run() to pick them up. A buffer (rather than an
-// unbuffered channel) is what makes batching in Run()'s propose case
-// actually effective under concurrent load: with no buffer, only a
-// proposal that happens to already be blocked mid-send at the exact
-// moment Run() checks would ever be found by the non-blocking drain: a
-// buffer lets many concurrent callers' proposals actually accumulate
-// while Run() is busy with the previous batch's Persist()/pump() cycle.
+// queued waiting for Run() to pick them up.
 const proposeChBufferSize = 256
+
+// Defaults for the batching window (see Server.batchWindow's doc) and
+// the safety cap on how large one batch can grow before flushing early
+// regardless of the window. These are conservative starting points, not
+// claimed-optimal — SetBatchWindow/SetMaxBatchSize exist so a caller
+// (or a benchmark sweeping the parameter) can tune them for its own
+// hardware and workload shape.
+const (
+	defaultBatchWindow  = 500 * time.Microsecond
+	defaultMaxBatchSize = 64
+)
 
 // New constructs a Server. tr and eng are assumed already open; Server
 // takes ownership of ticking/driving node but does NOT close tr or eng
@@ -122,6 +148,8 @@ func New(node raftNode, tr *transport.Transport, eng *engine.Engine, tickInterva
 		tr:           tr,
 		eng:          eng,
 		tickInterval: tickInterval,
+		batchWindow:  defaultBatchWindow,
+		maxBatchSize: defaultMaxBatchSize,
 		proposeCh:    make(chan proposeRequest, proposeChBufferSize),
 		stopCh:       make(chan struct{}),
 		doneCh:       make(chan struct{}),
@@ -130,12 +158,35 @@ func New(node raftNode, tr *transport.Transport, eng *engine.Engine, tickInterva
 	}
 }
 
+// SetBatchWindow overrides the default group-commit batching window (see
+// Server.batchWindow's doc). Must be called before Run(); changing it
+// after Run has started is not safe (Run reads it without a lock, since
+// under normal use it's set once at startup and never touched again).
+func (s *Server) SetBatchWindow(d time.Duration) { s.batchWindow = d }
+
+// SetMaxBatchSize overrides the default cap on how many proposals can
+// accumulate in one batch before it flushes early, regardless of
+// SetBatchWindow. Must be called before Run(), for the same reason as
+// SetBatchWindow.
+func (s *Server) SetMaxBatchSize(n int) { s.maxBatchSize = n }
+
 // Run drives the server's event loop until Stop is called. Intended to
 // be run in its own goroutine: `go srv.Run()`.
 func (s *Server) Run() {
 	defer close(s.doneCh)
 	ticker := time.NewTicker(s.tickInterval)
 	defer ticker.Stop()
+
+	// pending accumulates proposals across loop iterations between the
+	// first one arriving and the batch actually being submitted — see
+	// the batchWindow doc on why this waits at all instead of
+	// submitting immediately. batchTimerC is nil (blocks forever, i.e.
+	// effectively disabled) whenever there's no batch being
+	// accumulated; it's armed the moment the first proposal of a new
+	// batch arrives.
+	var pending []proposeRequest
+	var batchTimer *time.Timer
+	var batchTimerC <-chan time.Time
 
 	for {
 		select {
@@ -145,60 +196,61 @@ func (s *Server) Run() {
 
 		case m, ok := <-s.tr.Recv():
 			if !ok {
+				s.failPending(pending, fmt.Errorf("server: stopped"))
 				return
 			}
 			s.node.Step(m)
 			s.pump()
 
 		case req := <-s.proposeCh:
-			// Group commit: opportunistically drain every OTHER
-			// proposal already waiting in the channel right now, so
-			// all of them share the single Persist() (and therefore
-			// single WAL fsync) call this iteration makes, instead of
-			// each paying for its own. Under concurrent write load this
-			// is the single highest-leverage change for throughput —
-			// fsync latency, not CPU, is the bottleneck, and batching
-			// amortizes it across every proposal in the group.
-			s.drainAndAcceptProposals(req)
-			s.pump()
+			pending = append(pending, req)
+			switch {
+			case s.batchWindow <= 0 || len(pending) >= s.maxBatchSize:
+				// No window configured, or the batch is already as
+				// large as it's allowed to get: submit right now
+				// rather than waiting.
+				if batchTimer != nil {
+					batchTimer.Stop()
+					batchTimerC = nil
+				}
+				s.submitBatch(pending)
+				pending = nil
+			case len(pending) == 1:
+				// First proposal of a new batch: start the window.
+				// Later proposals arriving before it fires just join
+				// pending (see the case above and below) without
+				// restarting the timer — the window bounds how long
+				// the FIRST proposal in a batch waits, not a rolling
+				// window per-arrival.
+				batchTimer = time.NewTimer(s.batchWindow)
+				batchTimerC = batchTimer.C
+			}
+
+		case <-batchTimerC:
+			batchTimerC = nil
+			s.submitBatch(pending)
+			pending = nil
 
 		case <-s.stopCh:
+			s.failPending(pending, fmt.Errorf("server: stopped"))
 			return
 		}
 	}
 }
 
-// drainAndAcceptProposals accepts req (already received from proposeCh)
-// plus every other proposeRequest immediately available in the channel
-// right now, without blocking for more, and submits all of them via a
-// SINGLE ProposeBatch call — the other half of this project's group
-// commit optimization, alongside applyCommitted's batched ApplyBatch
-// call. Using ProposeBatch here (rather than calling Propose in a loop)
-// is what actually matters: Propose sends AppendEntries eagerly on every
-// call, so a loop of N Propose calls still produces N separate messages
-// to every follower — each triggering its own follower-side append,
-// persist, and response — even though the LEADER's own log append and
-// eventual WAL persist would batch just fine. ProposeBatch defers
-// sending until every entry in the group is already appended, so
-// followers receive one message carrying all of them.
-//
-// Split out from Run's select loop as its own method specifically so
-// it's directly testable: a test can pre-load several requests into the
-// (buffered) channel and call this once, deterministically confirming
-// all of them get accepted together, rather than relying on real
-// goroutine-scheduling timing to occasionally win the race.
-func (s *Server) drainAndAcceptProposals(req proposeRequest) {
-	reqs := []proposeRequest{req}
-drainLoop:
-	for {
-		select {
-		case req2 := <-s.proposeCh:
-			reqs = append(reqs, req2)
-		default:
-			break drainLoop
-		}
+// submitBatch proposes every request in reqs via a single ProposeBatch
+// call (see ProposeBatch's own doc for why this — not a loop of
+// individual Propose calls — is what makes batching actually reduce
+// network and follower-side work, not just the leader's own WAL
+// persistence), registers each one's waiter, then pumps the resulting
+// state forward. A no-op if reqs is empty (the batch timer can fire
+// after pending was already flushed by the max-size path in the same
+// iteration it was about to fire in; Go's timer/channel semantics don't
+// make that combination impossible to observe).
+func (s *Server) submitBatch(reqs []proposeRequest) {
+	if len(reqs) == 0 {
+		return
 	}
-
 	datas := make([][]byte, len(reqs))
 	for i, r := range reqs {
 		datas[i] = r.data
@@ -212,6 +264,19 @@ drainLoop:
 	}
 	for i, r := range reqs {
 		s.waiters[indices[i]] = pendingPropose{data: r.data, resultCh: r.resultCh}
+	}
+	s.pump()
+}
+
+// failPending immediately notifies every request still waiting to be
+// submitted (i.e. still sitting in Run's local `pending` slice, not yet
+// even proposed to Raft) that the server is stopping — without this,
+// those callers would otherwise hang until their own proposeTimeout
+// fires with a generic "timed out" error that doesn't actually explain
+// what happened.
+func (s *Server) failPending(pending []proposeRequest, err error) {
+	for _, r := range pending {
+		r.resultCh <- applyResult{err: err}
 	}
 }
 

@@ -149,6 +149,31 @@ type Raft struct {
 	nextIndex  map[uint64]uint64
 	matchIndex map[uint64]uint64
 
+	// sentIndex tracks, per peer, the highest log index included in the
+	// most recently SENT AppendEntries — distinct from nextIndex, which
+	// only advances on an acknowledgment. sendAppendEntries uses this to
+	// send only the entries NOT YET transmitted (rather than resending
+	// everything from nextIndex again every time), which is what
+	// prevents a real, measured O(N^2) bug: without this, N proposals
+	// arriving faster than one round trip completes each triggered a
+	// full resend of the whole still-unacknowledged backlog, so total
+	// data sent across N such calls grew as N(N+1)/2. An earlier version
+	// of this fix instead gated sending entirely (skip a peer that
+	// already has one outstanding) — simpler, but it collapsed
+	// replication to strict stop-and-wait (one outstanding request per
+	// peer, no pipelining), which turned out to cost real throughput on
+	// real hardware: measurement showed it, a naive "should be strictly
+	// better" assumption didn't catch it. Sending only the delta since
+	// the last SEND instead eliminates the redundant retransmission
+	// without giving up pipelining — multiple outstanding sends to the
+	// same peer are fine, since each one's PrevLogIndex is exactly
+	// where the previous one left off, and TCP's in-order, reliable
+	// delivery on the single persistent connection each peer pair uses
+	// (see the transport package) is what makes a follower processing
+	// them in the order they were sent - and therefore each one's
+	// consistency check - safe.
+	sentIndex map[uint64]uint64
+
 	// Candidate-only volatile state. Reset fresh on every new election.
 	votesReceived map[uint64]bool
 
@@ -369,6 +394,7 @@ func (r *Raft) becomeLeader() {
 	r.leaderID = r.id
 	r.nextIndex = make(map[uint64]uint64, len(r.peers))
 	r.matchIndex = make(map[uint64]uint64, len(r.peers))
+	r.sentIndex = make(map[uint64]uint64, len(r.peers))
 	for _, p := range r.peers {
 		r.nextIndex[p] = r.lastLogIndex() + 1
 		r.matchIndex[p] = 0
@@ -386,11 +412,18 @@ func (r *Raft) sendHeartbeats() {
 	}
 }
 
-// sendAppendEntries sends peer everything from its recorded nextIndex
-// onward (empty, i.e. a pure heartbeat, if it's already caught up).
+// sendAppendEntries sends peer only the entries not yet transmitted to
+// it: everything from max(sentIndex[peer], nextIndex[peer]-1) onward
+// (empty, i.e. a pure heartbeat, if there's nothing new). Using
+// nextIndex-1 as a floor — rather than always trusting sentIndex — is
+// what makes a conflict-retry (see handleAppendEntriesResponse's failure
+// path, which explicitly resets sentIndex first) correctly restart from
+// the authoritative acknowledged point instead of a stale optimistic one.
 func (r *Raft) sendAppendEntries(peer uint64) {
-	ni := r.nextIndex[peer]
-	prevIndex := ni - 1
+	prevIndex := r.nextIndex[peer] - 1
+	if r.sentIndex[peer] > prevIndex {
+		prevIndex = r.sentIndex[peer]
+	}
 	prevTerm := r.termAt(prevIndex)
 	entries := r.Entries(prevIndex, r.lastLogIndex())
 	r.send(Message{
@@ -401,6 +434,9 @@ func (r *Raft) sendAppendEntries(peer uint64) {
 		Entries:      entries,
 		LeaderCommit: r.commitIndex,
 	})
+	if r.lastLogIndex() > r.sentIndex[peer] {
+		r.sentIndex[peer] = r.lastLogIndex()
+	}
 }
 
 func (r *Raft) handleRequestVote(m Message) {
@@ -509,17 +545,21 @@ func (r *Raft) handleAppendEntriesResponse(m Message) {
 	}
 
 	// Log inconsistency: back nextIndex up by one and retry immediately.
-	// This is the simple, always-correct backoff the Raft paper
-	// describes; it also describes an optional optimization (the
-	// follower reporting the conflicting term so the leader can skip
-	// back a whole term at once instead of one entry at a time), which
-	// we don't implement — a deliberate scope decision, since it only
-	// affects how fast a badly-lagging follower catches up, not
-	// correctness, and is a natural target to revisit if the
+	// Also reset sentIndex so the retry starts from the authoritative,
+	// acknowledged-safe nextIndex-1 rather than a stale, possibly-
+	// conflicting point sendAppendEntries had optimistically sent
+	// before this rejection. This is the simple, always-correct backoff
+	// the Raft paper describes; it also describes an optional
+	// optimization (the follower reporting the conflicting term so the
+	// leader can skip back a whole term at once instead of one entry at
+	// a time), which we don't implement — a deliberate scope decision,
+	// since it only affects how fast a badly-lagging follower catches
+	// up, not correctness, and is a natural target to revisit if the
 	// benchmarking phase shows slow catch-up after a partition heals.
 	if r.nextIndex[m.From] > 1 {
 		r.nextIndex[m.From]--
 	}
+	r.sentIndex[m.From] = 0
 	r.sendAppendEntries(m.From)
 }
 

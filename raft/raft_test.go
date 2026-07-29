@@ -521,6 +521,16 @@ func TestProposeBatch_SendsOneMessagePerPeerNotOnePerEntry(t *testing.T) {
 	r.Ready() // drain the become-leader heartbeat messages
 	r.Advance()
 
+	// Simulate both peers acknowledging that initial heartbeat, as a
+	// real cluster would — otherwise ProposeBatch's own eager send
+	// would correctly (per the fix this test exists to verify) skip
+	// sending while that heartbeat is still outstanding.
+	for _, peer := range []uint64{2, 3} {
+		r.Step(Message{Type: MsgAppendEntriesResponse, To: r.id, From: peer, Term: r.currentTerm, Success: true, MatchIndex: 0})
+	}
+	r.Ready()
+	r.Advance()
+
 	_, err := r.ProposeBatch([][]byte{[]byte("a"), []byte("b"), []byte("c")})
 	if err != nil {
 		t.Fatal(err)
@@ -557,6 +567,89 @@ func TestProposeBatch_EmptyBatchStillSucceedsAsLeader(t *testing.T) {
 	}
 	if len(indices) != 0 {
 		t.Fatalf("indices = %v, want empty", indices)
+	}
+}
+
+// TestProposeBatch_RepeatedCallsBeforeAckSendOnlyTheNewDelta is the
+// direct regression test for the real O(N^2) bug this project found and
+// fixed: sendAppendEntries used to always resend EVERYTHING from
+// nextIndex onward, and nextIndex only advances on an acknowledgment —
+// so calling ProposeBatch repeatedly before any response arrives (many
+// proposals arriving faster than one round trip completes) resent an
+// ever-growing, mostly-redundant prefix every time. Without the fix,
+// three such calls would transmit 1+2+3=6 entry-equivalents for 3 real
+// proposals; with it, exactly 3 — each call sends only what hasn't been
+// sent yet.
+func TestProposeBatch_RepeatedCallsBeforeAckSendOnlyTheNewDelta(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2}, ElectionTick: 10, HeartbeatTick: 1})
+	r.becomeCandidate()
+	r.becomeLeader()
+	r.Ready()
+	r.Advance()
+	// Ack the become-leader heartbeat so we start from a clean, settled
+	// state before the real test begins.
+	r.Step(Message{Type: MsgAppendEntriesResponse, To: r.id, From: 2, Term: r.currentTerm, Success: true, MatchIndex: 0})
+	r.Ready()
+	r.Advance()
+
+	// Three proposals in a row, with no response delivered in between —
+	// exactly the scenario that caused the original bug.
+	for _, data := range [][]byte{[]byte("a"), []byte("b"), []byte("c")} {
+		if _, err := r.ProposeBatch([][]byte{data}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var totalEntriesSent int
+	for _, m := range r.Ready().Messages {
+		if m.Type == MsgAppendEntries && m.To == 2 {
+			totalEntriesSent += len(m.Entries)
+		}
+	}
+	if totalEntriesSent != 3 {
+		t.Fatalf("total entries transmitted across 3 separate proposals = %d, want exactly 3 (no redundant retransmission)", totalEntriesSent)
+	}
+}
+
+// TestSendAppendEntries_ConflictRetryUsesAuthoritativeNextIndexNotStaleSentIndex
+// verifies the other correctness-critical half of the delta-sending
+// design: after a follower rejects an AppendEntries (a log conflict),
+// the retry must restart from the backed-off, authoritative nextIndex,
+// not from whatever had been optimistically sent (and now might not
+// actually be valid) before the rejection.
+func TestSendAppendEntries_ConflictRetryUsesAuthoritativeNextIndexNotStaleSentIndex(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2}, ElectionTick: 10, HeartbeatTick: 1})
+	r.becomeCandidate()
+	r.becomeLeader()
+	r.Ready()
+	r.Advance()
+
+	// Propose twice without ever acking: sentIndex[2] advances to 2,
+	// while nextIndex[2] stays at its initial value of 1.
+	r.ProposeBatch([][]byte{[]byte("a"), []byte("b")})
+	r.Ready()
+	r.Advance()
+
+	// The follower rejects (a conflict).
+	r.Step(Message{Type: MsgAppendEntriesResponse, To: r.id, From: 2, Term: r.currentTerm, Success: false})
+
+	var retry *Message
+	for _, m := range r.Ready().Messages {
+		m := m
+		if m.Type == MsgAppendEntries && m.To == 2 {
+			retry = &m
+		}
+	}
+	if retry == nil {
+		t.Fatal("expected a retry AppendEntries after the conflict response")
+	}
+	// nextIndex[2] was 1 (never having reached >1, the backoff guard
+	// left it unchanged), so the retry's PrevLogIndex must be 0 — the
+	// authoritative nextIndex-1. Without resetting sentIndex on this
+	// path, it would incorrectly be 2 (the stale, now-distrusted point
+	// from the earlier optimistic sends).
+	if retry.PrevLogIndex != 0 {
+		t.Fatalf("retry PrevLogIndex = %d, want 0 (authoritative nextIndex-1, not a stale sentIndex)", retry.PrevLogIndex)
 	}
 }
 

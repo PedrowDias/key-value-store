@@ -112,18 +112,39 @@ that only shows up after a crash at the wrong moment — encoding the
 ordering into the API, rather than trusting every caller to remember it,
 is the point.
 
-**Group commit required two coordinated fixes, not one.** The first
-attempt (batch a server's pending writes into one `engine` WAL fsync)
-measured almost no improvement — throughput stayed flat regardless of
-concurrent load, the signature of an unbatched bottleneck elsewhere.
-Tracing it down: `raft.Propose()` sends `AppendEntries` to every peer
-*eagerly, on every call* — batching the leader's own WAL persistence did
-nothing to batch the network fan-out or follower-side work gated behind
-it. The real fix, `raft.ProposeBatch`, defers sending until a whole batch
-of entries is appended, so followers get one message instead of N. Real
-measured result: **~4-5x write throughput, ~6-7x better p50 latency**
-under concurrent load (details and the full investigation are in
-[`bench/BENCHMARKS.md`](bench/BENCHMARKS.md)).
+**Group commit took four rounds to actually get right, and the last two
+found real bugs — one in the benchmark tool, one genuinely in `raft`
+itself, and fixing the second one properly required a redesign, not a
+patch.** Round 1 (batch a server's pending writes into one `engine` WAL
+fsync) measured almost no improvement — an unbatched bottleneck existed
+elsewhere. Round 2, `raft.ProposeBatch`, fixed `raft.Propose()`'s
+eager, per-call `AppendEntries` send, which had been undoing the
+batching benefit. Round 3 attempted a further fix — gating a peer's
+eager send while one was already outstanding — which sandbox
+measurement showed improving every configuration; a follow-up
+real-hardware re-check (treated as necessary, not optional, precisely
+because the earlier `ProposeBatch` investigation had already shown
+sandbox results alone can mislead) caught something the sandbox
+comparison had missed entirely: on real hardware, every non-zero batch
+window got *dramatically worse*, not better. The mechanism: the
+original bug's redundant, unconditional resending had accidentally
+provided pipelining (many overlapping in-flight messages) as a side
+effect of the redundancy; gating removed the redundant bytes but also
+removed that accidental pipelining, forcing strict stop-and-wait
+replication. Round 4, the actual fix: track what's been *sent* to each
+peer, not just what's been *acknowledged*, and always transmit only the
+delta — eliminating the redundant retransmission at its source (each
+send's content) rather than by gating whether a send happens, so full
+pipelining is preserved. Verified with a dedicated unit test asserting
+the exact byte-level property (three proposals before any acknowledgment
+transmit exactly 3 entry-equivalents, not 6), not just a throughput
+number. Full account of all four rounds, including the regression that
+round 3 caused and how it was caught, is in
+[`bench/BENCHMARKS.md`](bench/BENCHMARKS.md) — the process, including
+two rounds that were each real improvements and each incomplete in ways
+that only showed up under conditions the previous testing hadn't
+covered, is the more interesting and more honest part of the story than
+any single number.
 
 **Reads don't go through Raft.** `Get` reads local state directly —
 fast and available even mid-election, but only eventually consistent
@@ -169,9 +190,21 @@ of what this project actually demonstrates.
   someone else's actually did. Every pending proposal now compares its
   own bytes against what actually committed at that index before
   reporting success.
-- **Group commit's first version didn't work**, and confirming that
-  with real measurement (not just "the code looks like it batches") is
-  what caught it — see the design section above.
+- **Group commit took four rounds to actually get right**: the first
+  version didn't work, a follow-up fix (a tunable batching window)
+  produced numbers that didn't make sense, leading to a benchmark-tool
+  connection-pool bug and a genuine O(N²) redundant-retransmission bug
+  in `raft` itself. The first fix for *that* bug — gating a peer's
+  eager send while one was outstanding — looked like a clean win in
+  the sandbox, but a real-hardware re-check caught a regression the
+  sandbox comparison had missed: the fix had accidentally traded away
+  pipelining the original bug's redundancy had been providing as a
+  side effect. The actual fix tracks what's been *sent* per peer, not
+  just what's been *acknowledged*, eliminating the redundant bytes
+  without giving up pipelining. None of this would have been caught
+  without insisting on real-hardware confirmation even after a
+  sandbox result already looked like success — see the design section
+  above and `bench/BENCHMARKS.md` for the full account.
 
 ## Benchmark results
 
@@ -182,9 +215,8 @@ Full methodology and every number in
 |---|---|
 | Storage engine reads vs. a naive (but genuinely durable) baseline | up to **70x** faster |
 | Storage engine writes vs. the same baseline | **1.2-1.3x** faster (both durably `fsync`; this isolates filesystem overhead, not durability) |
-| Real cluster write throughput, sandbox before/after group commit | ~280 -> **~1,300-1,600 ops/sec** (~4-5x, same hardware both sides) |
-| Real cluster write p50 latency, sandbox before -> after | ~75ms -> **~12ms** |
-| Real cluster write throughput, Apple M3 (post-fix, no M3 baseline measured) | 521 ops/sec at 20 workers, **1,940 ops/sec** at 100 workers |
+| Real cluster write throughput, sandbox: no batching -> `ProposeBatch` | ~280 -> ~1,300-1,600 ops/sec (same hardware) |
+| Real cluster write throughput, `ProposeBatch` + batch window, confirmed on Apple M3 | ~90-2,240 ops/sec depending on window size, matching or exceeding the pre-regression baseline on every window tested — full four-round investigation (including a real regression found and fixed) in [`bench/BENCHMARKS.md`](bench/BENCHMARKS.md) |
 | Leader failover time (kill -> new leader committing again) | **~700ms**, p99 ~704ms, across 10 trials |
 
 The naive baseline (`bench.NaiveStore`) is deliberately *not* a strawman:
