@@ -525,13 +525,24 @@ just those 20):
 
 | | min | mean | max |
 |---|---|---|---|
-| Async | 539-717 µs | 677-880 µs | 922-1,142 µs |
-| SyncFlush | 2,498-2,688 µs | 2,934-3,988 µs | 3,481-13,372 µs |
+| Async (sandbox) | 539-717 µs | 677-880 µs | 922-1,142 µs |
+| SyncFlush (sandbox) | 2,498-2,688 µs | 2,934-3,988 µs | 3,481-13,372 µs |
+| Async (Apple M3) | 3,363 µs | 3,652 µs | 4,145 µs |
+| SyncFlush (Apple M3) | 5,797 µs | 8,062 µs | 9,278 µs |
 
-Consistent across 9 runs: **roughly 3.5-4.7x faster mean latency** for
-the write that triggers a flush, and — notably — far *less variable*
-(async's own max never exceeds ~1.1ms; sync's ranges as high as 13.4ms).
-This is exactly the claim the feature makes, cleanly confirmed.
+Consistent across 9 sandbox runs and confirmed on real hardware:
+**roughly 2.2-4.7x faster mean latency** for the write that triggers a
+flush (2.2x on the M3, 3.5-4.7x in sandbox), and — notably — far *less
+variable* in every environment (async's own max stays close to its
+mean; sync's spikes well beyond it, up to 13.4ms in one sandbox run).
+The M3's absolute numbers are considerably higher than the sandbox's
+across the board (not just the ratio between async/sync) — plausibly
+because this measurement immediately followed a `-race -count=15`
+stress run of the full engine suite on the same machine, which could
+leave real, if temporary, contention or thermal effects; the *relative*
+finding (async meaningfully faster, less variable) held up regardless.
+This is exactly the claim the feature makes, confirmed in both
+environments.
 
 ### The complicated part: sustained concurrent load
 
@@ -545,12 +556,16 @@ happen during the run:
 
 | | p50 | p99 | max | throughput |
 |---|---|---|---|---|
-| Async | 12,277-14,381 µs | 34,381-40,341 µs | 35,700-66,186 µs | 1,207-1,489 ops/sec |
-| SyncFlush | 13,255-13,863 µs | 17,649-43,654 µs | 18,130-54,282 µs | 1,355-1,445 ops/sec |
+| Async (sandbox) | 12,277-14,381 µs | 34,381-40,341 µs | 35,700-66,186 µs | 1,207-1,489 ops/sec |
+| SyncFlush (sandbox) | 13,255-13,863 µs | 17,649-43,654 µs | 18,130-54,282 µs | 1,355-1,445 ops/sec |
+| Async (Apple M3) | 56,421 µs | 99,872 µs | 113,090 µs | 347.1 ops/sec |
+| SyncFlush (Apple M3) | 59,996 µs | 72,476 µs | 82,022 µs | 330.9 ops/sec |
 
-Not a clean win — genuinely mixed across repeated runs, with sync
-sometimes matching or beating async on p99 and max. Rather than
-explain this away, tracing it down: this project bounds itself to *at
+Not a clean win — genuinely mixed in both environments, with sync
+matching or beating async on p99 and max both in sandbox runs and on
+the M3 (where sync's p99 and max were both clearly *lower* than
+async's). Rather than explain this away, tracing it down: this project
+bounds itself to *at
 most one flush in flight at a time* (see `engine`'s package doc) — a
 deliberate simplicity tradeoff over an unbounded queue of pending
 memtables. The consequence: **any** concurrent write that arrives while
@@ -560,7 +575,9 @@ Under sustained heavy concurrency with frequent flushes, nearly every
 writer ends up waiting for flush completion one way or another — via
 this gate for async, via contending for one mutex for sync — which
 substantially narrows, and sometimes reverses, the aggregate advantage
-the isolated measurement above shows so clearly.
+the isolated measurement above shows so clearly. That this reproduced
+on real hardware, not only in sandbox runs, is good evidence this is a
+genuine property of the design rather than a sandbox-specific quirk.
 
 This is a real, honest limitation of the current design, not a
 benchmark artifact: the single-flush-in-flight bound trades away some

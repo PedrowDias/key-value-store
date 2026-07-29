@@ -135,10 +135,12 @@ comparison, not just asserting one: `bench/engine_bench_test.go`'s
 using the same real `wal`/`memtable`/`sstable` packages, so measuring
 against it isolates locking discipline, not implementation quality. The
 result is genuinely two-sided: for a single writer, the specific write
-that triggers a flush is **3.5-4.7x faster** and far less variable,
-consistently across 9 runs — exactly the claim confirmed cleanly. Under
-sustained *concurrent* load, the picture is much messier — sometimes
-comparable, sometimes worse than the synchronous design — because this
+that triggers a flush is **2.2-4.7x faster** and far less variable —
+confirmed both in sandbox runs (3.5-4.7x, 9 repeated runs) and on real
+Apple M3 hardware (2.2x) — exactly the claim confirmed cleanly in both
+environments. Under sustained *concurrent* load, the picture is much
+messier — sometimes comparable, sometimes worse than the synchronous
+design, on the M3 as well as in sandbox — because this
 project bounds itself to at most one flush in flight at a time (a
 deliberate simplicity tradeoff over an unbounded queue of pending
 memtables), so under heavy concurrency nearly every writer ends up
@@ -269,8 +271,8 @@ Full methodology and every number in
 |---|---|
 | Storage engine reads vs. a naive (but genuinely durable) baseline | up to **70x** faster |
 | Block cache: repeated ("hot key") reads once data exceeds the memtable | **1.16x** faster, confirmed on Apple M3 (sandbox measured 1.7-2.5x — see [`bench/BENCHMARKS.md`](bench/BENCHMARKS.md) for why real hardware showed less, and why that's not a red flag) |
-| Async flush: the write that triggers a flush, single writer | **3.5-4.7x** faster mean latency, far less variable (consistent across 9 runs) |
-| Async flush: aggregate p99 under heavy concurrent load | Mixed — sometimes worse than synchronous flush, due to this project's at-most-one-flush-in-flight bound (see [`bench/BENCHMARKS.md`](bench/BENCHMARKS.md)) |
+| Async flush: the write that triggers a flush, single writer | **2.2-4.7x** faster mean latency, far less variable — confirmed on Apple M3 (2.2x) and sandbox (3.5-4.7x) |
+| Async flush: aggregate p99 under heavy concurrent load | Mixed — sometimes worse than synchronous flush on both Apple M3 and sandbox, due to this project's at-most-one-flush-in-flight bound (see [`bench/BENCHMARKS.md`](bench/BENCHMARKS.md)) |
 | Storage engine writes vs. the same baseline | **1.2-1.3x** faster (both durably `fsync`; this isolates filesystem overhead, not durability) |
 | Real cluster write throughput, sandbox: no batching -> `ProposeBatch` | ~280 -> ~1,300-1,600 ops/sec (same hardware) |
 | Real cluster write throughput, `ProposeBatch` + batch window, confirmed on Apple M3 | ~90-2,240 ops/sec depending on window size, matching or exceeding the pre-regression baseline on every window tested — full four-round investigation (including a real regression found and fixed) in [`bench/BENCHMARKS.md`](bench/BENCHMARKS.md) |
