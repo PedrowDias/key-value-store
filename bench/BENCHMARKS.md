@@ -594,9 +594,72 @@ Raft-driven `applyCommitted` call per commit, not many independent
 concurrent writers hammering the engine directly) actually resembles
 more closely.
 
+## Log compaction / snapshotting: creation cost and catch-up time
+
+Measured on the same Apple M3, via:
+
+```bash
+go test ./bench/... -bench=BenchmarkSnapshotCreation -benchmem -run=^$
+go test ./bench/... -run TestSnapshotCatchUpTime -v
+```
+
+**Snapshot creation cost, as the dataset it covers grows** (see the
+README's "Known limitations": `Snapshot` gathers every distinct key and
+calls `Get` per key, not a proper k-way merge):
+
+| Keys | Time/op | Per-key cost | Allocs/op |
+|---|---|---|---|
+| 1,000 | 331.5 µs | 331 ns/key | 2,034 |
+| 10,000 | 4.84 ms | 484 ns/key | 20,096 |
+| 50,000 | 90.2 ms | 1,804 ns/key | 1,914,351 |
+
+Per-key cost roughly a third again worse at 10,000 keys than at 1,000 —
+consistent with ordinary constant-factor overhead, both still comfortably
+inside the engine's default 4 MiB memtable threshold (1,000 keys at
+~90 bytes each is under 0.1 MiB; 10,000 is well under 1 MiB) where
+`Snapshot`'s underlying `Get` calls are pure in-memory skip-list lookups.
+**50,000 keys (~4.4 MiB of this benchmark's data) crosses that
+threshold**, meaning at least one background flush has happened by the
+time `Snapshot` runs — its `Get` calls now sometimes hit a real SSTable
+(bloom filter check, block read) instead of memory alone, and per-key
+cost jumps another ~3.7x accordingly. This is the same "pure memtable
+reads vs. reads that reach a real SSTable" split documented in the Get
+benchmark above, showing up again here for exactly the same underlying
+reason — direct, quantified evidence for the per-key `Get` tradeoff
+rather than an abstract description of it: a genuine k-way merge
+wouldn't re-pay a bloom-filter-and-block-read cost per key the way this
+approach does once data has actually reached disk.
+
+**Real follower catch-up time via `InstallSnapshot`** — a follower
+killed outright, held down while the leader commits 300 more writes
+(crossing its snapshot-compaction threshold six times over), then
+restarted fresh from its last on-disk state and timed until its
+`commitIndex` matches the leader's (5 trials):
+
+| | Time |
+|---|---|
+| min | 73.6 ms |
+| mean | 85.5 ms |
+| max | 97.7 ms |
+
+Tight, consistent range — under two tick intervals (50ms ticks) in every
+trial, and no election is needed here (the existing leader never
+changes), so this is essentially the cost of a real process restart plus
+TCP reconnect plus a real `InstallSnapshot` round trip and engine
+restoration, not a leadership change. The snapshot itself is small in
+this test (a few hundred trivial key-value pairs) — the *transfer and
+restoration* mechanics are what's being measured as fast and reliable
+here, not how time scales with a much larger snapshot's size, which the
+creation-cost table above already speaks to separately: a leader with a
+multi-gigabyte dataset would take measurably longer to *build* the
+snapshot it sends, on top of whatever this table shows for receiving and
+installing it.
+
 ## Reproducing these results
 
 ```bash
 go test ./bench/... -run TestClusterThroughputAndLatency -v
 go test ./bench/... -run TestBatchWindowSweep -v
+go test ./bench/... -bench=BenchmarkSnapshotCreation -benchmem -run=^$
+go test ./bench/... -run TestSnapshotCatchUpTime -v
 ```

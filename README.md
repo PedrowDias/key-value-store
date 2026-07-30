@@ -428,7 +428,12 @@ cluster.
   and every SSTable — simpler, and reuses `Get`'s own already-correct
   logic, at the cost of being less time- and space-efficient than a
   merge for a much larger dataset than this project's scope actually
-  needs to handle.
+  needs to handle. Confirmed on real M3 hardware: per-key cost roughly
+  quadruples (484 ns/key -> 1,804 ns/key) once the dataset crosses the
+  memtable's flush threshold and `Get` starts occasionally hitting a
+  real SSTable instead of memory alone — see
+  [`bench/BENCHMARKS.md`](bench/BENCHMARKS.md) for the full numbers,
+  including real-cluster catch-up timing via `InstallSnapshot`.
 
 ## Project layout
 
