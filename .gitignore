@@ -1,0 +1,4 @@
+kvstore
+data/
+*.test
+*.out
