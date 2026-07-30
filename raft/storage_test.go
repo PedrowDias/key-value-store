@@ -17,7 +17,7 @@ func tempStoragePath(t *testing.T) string {
 // --- Round-trip correctness ---------------------------------------------------
 
 func TestStorage_FreshOpenReturnsEmptyState(t *testing.T) {
-	s, hs, log, err := OpenStorage(tempStoragePath(t))
+	s, hs, log, _, err := OpenStorage(tempStoragePath(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +32,7 @@ func TestStorage_FreshOpenReturnsEmptyState(t *testing.T) {
 
 func TestStorage_HardStatePersistsAcrossReopen(t *testing.T) {
 	path := tempStoragePath(t)
-	s, _, _, err := OpenStorage(path)
+	s, _, _, _, err := OpenStorage(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func TestStorage_HardStatePersistsAcrossReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s2, hs, _, err := OpenStorage(path)
+	s2, hs, _, _, err := OpenStorage(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +55,7 @@ func TestStorage_HardStatePersistsAcrossReopen(t *testing.T) {
 
 func TestStorage_HardStateOverwritePersistsLatest(t *testing.T) {
 	path := tempStoragePath(t)
-	s, _, _, err := OpenStorage(path)
+	s, _, _, _, err := OpenStorage(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestStorage_HardStateOverwritePersistsLatest(t *testing.T) {
 	s.SaveHardState(HardState{Term: 5, Vote: 9})
 	s.Close()
 
-	_, hs, _, err := OpenStorage(path)
+	_, hs, _, _, err := OpenStorage(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func TestStorage_HardStateOverwritePersistsLatest(t *testing.T) {
 
 func TestStorage_EntriesPersistAcrossReopen(t *testing.T) {
 	path := tempStoragePath(t)
-	s, _, _, err := OpenStorage(path)
+	s, _, _, _, err := OpenStorage(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestStorage_EntriesPersistAcrossReopen(t *testing.T) {
 	}
 	s.Close()
 
-	_, _, log, err := OpenStorage(path)
+	_, _, log, _, err := OpenStorage(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func TestStorage_EntriesPersistAcrossReopen(t *testing.T) {
 
 func TestStorage_SaveEntriesEmptyIsNoop(t *testing.T) {
 	path := tempStoragePath(t)
-	s, _, _, err := OpenStorage(path)
+	s, _, _, _, err := OpenStorage(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func TestStorage_SaveEntriesEmptyIsNoop(t *testing.T) {
 	}
 	s.Close()
 
-	_, _, log, err := OpenStorage(path)
+	_, _, log, _, err := OpenStorage(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func TestStorage_SaveEntriesEmptyIsNoop(t *testing.T) {
 
 func TestStorage_TruncationDiscardsConflictingEntriesOnRecovery(t *testing.T) {
 	path := tempStoragePath(t)
-	s, _, _, err := OpenStorage(path)
+	s, _, _, _, err := OpenStorage(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +146,7 @@ func TestStorage_TruncationDiscardsConflictingEntriesOnRecovery(t *testing.T) {
 	})
 	s.Close()
 
-	_, _, log, err := OpenStorage(path)
+	_, _, log, _, err := OpenStorage(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +211,7 @@ func TestOpenStorage_UnknownRecordKindIsError(t *testing.T) {
 	}
 	w.Close()
 
-	_, _, _, err = OpenStorage(path)
+	_, _, _, _, err = OpenStorage(path)
 	if err == nil {
 		t.Fatal("expected an error opening storage with an unknown record kind")
 	}
@@ -226,7 +226,7 @@ func TestOpenStorage_MalformedHardStateRecordPropagatesError(t *testing.T) {
 	w.Append(wal.Record{SeqNum: 1, Type: wal.RecordPut, Value: encodeRecord(recordHardState, []byte{1, 2})})
 	w.Close()
 
-	_, _, _, err = OpenStorage(path)
+	_, _, _, _, err = OpenStorage(path)
 	if err == nil {
 		t.Fatal("expected an error opening storage with a malformed hard state record")
 	}
@@ -241,7 +241,7 @@ func TestOpenStorage_MalformedLogEntryRecordPropagatesError(t *testing.T) {
 	w.Append(wal.Record{SeqNum: 1, Type: wal.RecordPut, Value: encodeRecord(recordLogEntry, []byte{1, 2})})
 	w.Close()
 
-	_, _, _, err = OpenStorage(path)
+	_, _, _, _, err = OpenStorage(path)
 	if err == nil {
 		t.Fatal("expected an error opening storage with a malformed log entry record")
 	}
@@ -256,7 +256,7 @@ func TestOpenStorage_MalformedTruncateRecordPropagatesError(t *testing.T) {
 	w.Append(wal.Record{SeqNum: 1, Type: wal.RecordPut, Value: encodeRecord(recordTruncateFrom, []byte{1, 2})})
 	w.Close()
 
-	_, _, _, err = OpenStorage(path)
+	_, _, _, _, err = OpenStorage(path)
 	if err == nil {
 		t.Fatal("expected an error opening storage with a malformed truncate record")
 	}
@@ -266,7 +266,7 @@ func TestOpenStorage_ReplayErrorPropagates(t *testing.T) {
 	// A directory instead of a file makes wal.Replay itself fail, which
 	// OpenStorage must propagate rather than papering over.
 	dir := t.TempDir()
-	_, _, _, err := OpenStorage(dir)
+	_, _, _, _, err := OpenStorage(dir)
 	if err == nil {
 		t.Fatal("expected an error when the storage path is a directory")
 	}
@@ -286,7 +286,7 @@ func TestOpenStorage_EmptyRecordValuePropagatesDecodeError(t *testing.T) {
 	}
 	w.Close()
 
-	_, _, _, err = OpenStorage(path)
+	_, _, _, _, err = OpenStorage(path)
 	if err == nil {
 		t.Fatal("expected an error opening storage with an empty record value")
 	}
@@ -299,7 +299,7 @@ func TestOpenStorage_WALOpenErrorPropagates(t *testing.T) {
 	}
 	defer func() { openWALLog = orig }()
 
-	_, _, _, err := OpenStorage(tempStoragePath(t))
+	_, _, _, _, err := OpenStorage(tempStoragePath(t))
 	if err == nil {
 		t.Fatal("expected an error propagated from a failing wal.Open")
 	}

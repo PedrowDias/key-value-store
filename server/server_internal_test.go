@@ -44,6 +44,21 @@ type fakeRaftNode struct {
 	// fake only needs to exercise Server's OWN plumbing around it.
 	autoConfirmReadIndex bool
 	pendingReadStates    []raft.ReadState
+	// snapshotToApply, if set, is returned once (then cleared) by the
+	// next Persist() call — simulating raft.Node reporting a just-
+	// installed snapshot the application needs to restore from.
+	snapshotToApply *raft.Snapshot
+
+	// createSnapshotErr, if set, is what CreateSnapshot returns instead
+	// of succeeding. createSnapshotCalls records every successful call
+	// for tests to inspect.
+	createSnapshotErr   error
+	createSnapshotCalls []createSnapshotCall
+}
+
+type createSnapshotCall struct {
+	index uint64
+	data  []byte
 }
 
 func newFakeRaftNode() *fakeRaftNode {
@@ -114,13 +129,29 @@ func (f *fakeRaftNode) RequestReadIndex(ctx uint64) error {
 	return nil
 }
 
-func (f *fakeRaftNode) Persist() ([]raft.Message, []raft.ReadState, error) {
+// CreateSnapshot records each call (index and data) for tests to
+// inspect, and returns createSnapshotErr if set — the fake doesn't need
+// to model any real compaction, since that's already exhaustively
+// tested against the real raft.Raft in the raft package's own tests;
+// here, Server's tests only need to see that it was called, with what
+// arguments, and that an error from it is handled correctly.
+func (f *fakeRaftNode) CreateSnapshot(index uint64, data []byte) error {
+	if f.createSnapshotErr != nil {
+		return f.createSnapshotErr
+	}
+	f.createSnapshotCalls = append(f.createSnapshotCalls, createSnapshotCall{index: index, data: data})
+	return nil
+}
+
+func (f *fakeRaftNode) Persist() ([]raft.Message, []raft.ReadState, *raft.Snapshot, error) {
 	if f.persistErr != nil {
-		return nil, nil, f.persistErr
+		return nil, nil, nil, f.persistErr
 	}
 	rs := f.pendingReadStates
 	f.pendingReadStates = nil
-	return f.persistMsgs, rs, nil
+	snap := f.snapshotToApply
+	f.snapshotToApply = nil
+	return f.persistMsgs, rs, snap, nil
 }
 
 func newTestEngine(t *testing.T) *engine.Engine {
@@ -573,11 +604,27 @@ func TestPump_ReadStateWithUnrecognizedContextIsIgnored(t *testing.T) {
 	}
 }
 
+// TestPump_SnapshotToApplyIsSurfacedButNotYetActuallyRestored confirms
+// pump()'s plumbing for a received snapshot works correctly up to the
+// point where actually restoring engine.Engine's state from it would go
+// — that restoration itself isn't implemented yet (see pump's own TODO
+// comment: a crash-safe file swap deserving the same careful, unhurried
+// design this project's other durability work has gotten, not something
+// to bolt on hastily). This test exists so that boundary is exercised
+// and visible, not silently untested.
+func TestPump_SnapshotToApplyIsSurfacedButNotYetActuallyRestored(t *testing.T) {
+	fake := newFakeRaftNode()
+	fake.snapshotToApply = &raft.Snapshot{LastIncludedIndex: 5, LastIncludedTerm: 1, Data: []byte("data")}
+
+	srv := New(fake, newTestTransport(t), newTestEngine(t), time.Hour)
+	srv.pump() // must not panic; must reach and pass the TODO branch
+}
+
 // --- Run()'s transport-channel-closed branch --------------------------------
 
 func TestRun_ExitsWhenTransportRecvChannelCloses(t *testing.T) {
 	dir := t.TempDir()
-	rn, err := raft.OpenNode(raft.Config{ID: 1, ElectionTick: 10, HeartbeatTick: 1}, filepath.Join(dir, "raft.wal"))
+	rn, _, err := raft.OpenNode(raft.Config{ID: 1, ElectionTick: 10, HeartbeatTick: 1}, filepath.Join(dir, "raft.wal"))
 	if err != nil {
 		t.Fatal(err)
 	}

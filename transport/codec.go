@@ -24,6 +24,8 @@ import (
 //	[4B  entry count][entries...]
 //	[8B  LeaderCommit][1B Success][8B MatchIndex]
 //	[8B  ReadContext]
+//	[8B  Snapshot.LastIncludedIndex][8B  Snapshot.LastIncludedTerm]
+//	[4B  Snapshot.Data length][Snapshot.Data]
 //
 // Each entry: [8B Term][8B Index][4B data length][data].
 //
@@ -34,7 +36,7 @@ import (
 // the benchmarking phase if per-message overhead ever shows up as a
 // real cost; not worth the complexity until it does.
 const (
-	fixedFieldsSize = 1 + 8 + 8 + 8 + 8 + 8 + 1 + 8 + 8 + 4 + 8 + 1 + 8 + 8
+	fixedFieldsSize = 1 + 8 + 8 + 8 + 8 + 8 + 1 + 8 + 8 + 4 + 8 + 1 + 8 + 8 + 8 + 8 + 4
 	entryHeaderSize = 8 + 8 + 4
 )
 
@@ -45,6 +47,7 @@ func encodeMessage(m raft.Message) []byte {
 	for _, e := range m.Entries {
 		size += entryHeaderSize + len(e.Data)
 	}
+	size += len(m.Snapshot.Data)
 	buf := make([]byte, size)
 	off := 0
 
@@ -75,6 +78,12 @@ func encodeMessage(m raft.Message) []byte {
 	off++
 	off += putUint64(buf[off:], m.MatchIndex)
 	off += putUint64(buf[off:], m.ReadContext)
+
+	off += putUint64(buf[off:], m.Snapshot.LastIncludedIndex)
+	off += putUint64(buf[off:], m.Snapshot.LastIncludedTerm)
+	binary.LittleEndian.PutUint32(buf[off:], uint32(len(m.Snapshot.Data)))
+	off += 4
+	off += copy(buf[off:], m.Snapshot.Data)
 
 	return buf
 }
@@ -144,6 +153,23 @@ func decodeMessage(data []byte) (raft.Message, error) {
 	off++
 	m.MatchIndex, off = getUint64(data, off)
 	m.ReadContext, off = getUint64(data, off)
+
+	if len(data)-off < 8+8+4 {
+		return raft.Message{}, errMalformedMessage
+	}
+	m.Snapshot.LastIncludedIndex, off = getUint64(data, off)
+	m.Snapshot.LastIncludedTerm, off = getUint64(data, off)
+	snapDataLen := binary.LittleEndian.Uint32(data[off:])
+	off += 4
+	// Same guard as an entry's own data length: validate against what's
+	// actually left before trusting it as a slice bound.
+	if uint32(len(data)-off) < snapDataLen {
+		return raft.Message{}, errMalformedMessage
+	}
+	if snapDataLen > 0 {
+		m.Snapshot.Data = append([]byte(nil), data[off:off+int(snapDataLen)]...)
+	}
+	off += int(snapDataLen)
 
 	return m, nil
 }

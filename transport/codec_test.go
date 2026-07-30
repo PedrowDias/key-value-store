@@ -14,7 +14,13 @@ func messagesEqual(a, b raft.Message) bool {
 		a.LastLogIndex != b.LastLogIndex || a.LastLogTerm != b.LastLogTerm ||
 		a.VoteGranted != b.VoteGranted || a.PrevLogIndex != b.PrevLogIndex ||
 		a.PrevLogTerm != b.PrevLogTerm || a.LeaderCommit != b.LeaderCommit ||
-		a.Success != b.Success || a.MatchIndex != b.MatchIndex {
+		a.Success != b.Success || a.MatchIndex != b.MatchIndex ||
+		a.ReadContext != b.ReadContext ||
+		a.Snapshot.LastIncludedIndex != b.Snapshot.LastIncludedIndex ||
+		a.Snapshot.LastIncludedTerm != b.Snapshot.LastIncludedTerm {
+		return false
+	}
+	if !bytes.Equal(a.Snapshot.Data, b.Snapshot.Data) {
 		return false
 	}
 	if len(a.Entries) != len(b.Entries) {
@@ -56,6 +62,17 @@ func TestCodec_RoundTrip_RequestVoteResponse(t *testing.T) {
 	}
 }
 
+func TestCodec_RoundTrip_AppendEntriesResponse(t *testing.T) {
+	m := raft.Message{Type: raft.MsgAppendEntriesResponse, From: 2, To: 1, Term: 3, Success: true, MatchIndex: 7}
+	decoded, err := decodeMessage(encodeMessage(m))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !messagesEqual(m, decoded) {
+		t.Fatalf("decoded = %+v, want %+v", decoded, m)
+	}
+}
+
 func TestCodec_RoundTrip_AppendEntriesWithEntries(t *testing.T) {
 	m := raft.Message{
 		Type: raft.MsgAppendEntries, From: 1, To: 2, Term: 3,
@@ -88,17 +105,6 @@ func TestCodec_RoundTrip_AppendEntriesEmpty(t *testing.T) {
 	}
 	if len(decoded.Entries) != 0 {
 		t.Fatalf("Entries = %+v, want empty", decoded.Entries)
-	}
-}
-
-func TestCodec_RoundTrip_AppendEntriesResponse(t *testing.T) {
-	m := raft.Message{Type: raft.MsgAppendEntriesResponse, From: 2, To: 1, Term: 3, Success: true, MatchIndex: 7}
-	decoded, err := decodeMessage(encodeMessage(m))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !messagesEqual(m, decoded) {
-		t.Fatalf("decoded = %+v, want %+v", decoded, m)
 	}
 }
 
@@ -148,12 +154,55 @@ func TestDecodeMessage_EntryDataLengthExceedsAvailableData(t *testing.T) {
 }
 
 func TestDecodeMessage_TruncatedAfterEntries(t *testing.T) {
-	m := raft.Message{Type: raft.MsgAppendEntries, Entries: []raft.LogEntry{{Term: 1, Index: 1}}}
+	// The entry needs some actual Data (not just a bare header) —
+	// without it, fixedFieldsSize (which already accounts for the full
+	// header+trailer+Snapshot-header split assuming zero entries) is
+	// large enough on its own that no truncation length can land inside
+	// the trailer's own bounds check without first tripping the
+	// earlier, coarser "long enough for the fixed portion at all" check
+	// instead.
+	m := raft.Message{Type: raft.MsgAppendEntries, Entries: []raft.LogEntry{{Term: 1, Index: 1, Data: []byte("0123456789")}}}
 	valid := encodeMessage(m)
-	// Cut off the trailing LeaderCommit/Success/MatchIndex fields.
-	truncated := valid[:len(valid)-3]
+	// Cut off the trailing LeaderCommit/Success/MatchIndex/ReadContext
+	// fields specifically: 25 bytes removes the entire 20-byte Snapshot
+	// header that trails them (for an empty snapshot, as here) plus 5
+	// bytes into that 25-byte block, landing within its own bounds
+	// check rather than the Snapshot section's or the earlier coarse
+	// length check.
+	truncated := valid[:len(valid)-25]
 	if _, err := decodeMessage(truncated); err == nil {
 		t.Fatal("expected an error when trailing fields are truncated")
+	}
+}
+
+func TestDecodeMessage_TruncatedWithinSnapshotHeader(t *testing.T) {
+	m := raft.Message{Type: raft.MsgAppendEntries}
+	valid := encodeMessage(m)
+	// Cut off just enough to land inside the Snapshot header
+	// (LastIncludedIndex/LastIncludedTerm/data-length-prefix) itself,
+	// leaving the ReadContext-inclusive trailer before it fully intact.
+	truncated := valid[:len(valid)-3]
+	if _, err := decodeMessage(truncated); err == nil {
+		t.Fatal("expected an error when the Snapshot header is truncated")
+	}
+}
+
+func TestDecodeMessage_SnapshotDataLengthExceedsAvailableData(t *testing.T) {
+	m := raft.Message{
+		Type:     raft.MsgInstallSnapshot,
+		Snapshot: raft.Snapshot{LastIncludedIndex: 1, LastIncludedTerm: 1, Data: []byte("real")},
+	}
+	valid := encodeMessage(m)
+
+	// The Snapshot data length prefix sits right after
+	// LastIncludedIndex/LastIncludedTerm, at the very end of the fixed
+	// portion of the buffer.
+	dataLenOffset := len(valid) - len(m.Snapshot.Data) - 4
+	corrupted := append([]byte(nil), valid...)
+	binary.LittleEndian.PutUint32(corrupted[dataLenOffset:], 999999)
+
+	if _, err := decodeMessage(corrupted); err == nil {
+		t.Fatal("expected an error when the Snapshot's declared data length exceeds what's actually present")
 	}
 }
 
@@ -177,19 +226,19 @@ func TestDecodeMessage_LaterEntryHeaderStarvedBySpaceHungryEarlierEntry(t *testi
 	const headerBeforeEntries = 1 + 8*5 + 1 + 8*2 + 4
 	dataLenOffset := headerBeforeEntries + 8 + 8 // past this entry's Term, Index
 
-	// Corrupt the first entry's declared data length from 5 to 49. This
+	// Corrupt the first entry's declared data length from 5 to 61. This
 	// must (a) still pass THIS entry's own "declared length <= all
-	// remaining bytes" check — 49 is comfortably under the ~60 bytes
-	// left in the buffer at that point — while (b) consuming 44 bytes
+	// remaining bytes" check — 61 is comfortably under the ~80 bytes
+	// left in the buffer at that point — while (b) consuming 56 bytes
 	// more than the real 5, which is exactly enough to eat into the
-	// space the second entry's 20-byte header needs (leaving only 11
-	// bytes), without changing the buffer's total length at all. (49,
-	// not the smaller value that would suffice with a shorter message
-	// layout, specifically to still land below the second entry's
-	// header size even with the trailing ReadContext field's extra 8
-	// bytes of slack elsewhere in the buffer.)
+	// space the second entry's 20-byte header needs, without changing
+	// the buffer's total length at all. (61, not a smaller value that
+	// would suffice with a shorter message layout, specifically to
+	// still land below the second entry's header size even with the
+	// trailing ReadContext and Snapshot fields' extra bytes of slack
+	// elsewhere in the buffer.)
 	corrupted := append([]byte(nil), valid...)
-	binary.LittleEndian.PutUint32(corrupted[dataLenOffset:], 49)
+	binary.LittleEndian.PutUint32(corrupted[dataLenOffset:], 61)
 
 	if _, err := decodeMessage(corrupted); err == nil {
 		t.Fatal("expected an error when an earlier entry's inflated data length starves a later entry's header")

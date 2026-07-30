@@ -243,6 +243,43 @@ handles was assigned context 0, colliding with 0's existing meaning as
 actually confirm. Both found via a real-cluster smoke test after the
 full unit and integration suite already passed.
 
+**Log compaction, coordinated by a small marker file rather than a
+manifest.** The Raft log growing unboundedly matters twice over: the
+in-memory log a leader needs to search, and — worse — a lagging or
+long-partitioned node eventually needing to replay a leader's *entire*
+history just to catch up. `Raft.CreateSnapshot` compacts the in-memory
+log the same way most Raft implementations do (generalize the existing
+index-0 dummy sentinel to sit at the snapshot's boundary instead), and
+a leader that no longer has what a peer's `nextIndex` needs sends
+`InstallSnapshot` instead of a normal `AppendEntries` — deliberately
+*not* using the same "assume it landed" optimism normal entries do,
+since a wrong assumption about a multi-megabyte snapshot is a much
+bigger cost than a wrong one about a single entry.
+
+The harder half was making this durable without risking a genuinely
+worse failure mode than the one being solved: naively swapping a whole
+directory of SSTable files for a new one risks a crash leaving both the
+old and new files discoverable at once, silently merging pre- and
+post-snapshot data. Both `raft`'s own log compaction and `engine`'s
+`RestoreSnapshot` solve this the same way — write everything new fully
+durably first, then commit atomically via one small marker file
+(write-to-temp, `fsync`, rename) recording the new minimum-valid
+sequence number; anything older is treated as already gone by every
+future `Open()`, whether or not it's been physically deleted yet. A
+crash at any point before that one atomic rename leaves the *old* state
+fully intact and valid; cleanup afterward is best-effort, since it's a
+disk-space concern, not a correctness one.
+
+Verified against a real 3-node cluster, not just the simulated one
+`raft`'s own tests use: wrote 90 keys with active snapshotting (a low
+threshold via `-snapshot-threshold` for a fast test), froze a follower
+mid-stream with `SIGSTOP` for 50 more writes — well past several of the
+leader's own compactions — healed it, and confirmed it caught up
+correctly, with a `RESTORE_MARKER` file on disk as direct evidence
+`RestoreSnapshot` actually ran rather than the data merely happening to
+match. Then killed and restarted the entire cluster and confirmed all
+90 keys survived exactly, across all three nodes.
+
 ## Real bugs found during development
 
 Finding and fixing these — not just writing code that compiled — is most
@@ -317,6 +354,27 @@ of what this project actually demonstrates.
   "no read context attached," so it could never be told apart from an
   ordinary message. Fixed, then reverified against the same real
   cluster — see the design section above.
+- **A restart-recovery gap invisible in every multi-node test, exposed
+  by snapshotting's own persistence tests**: `Raft.restoreState` never
+  restored `commitIndex` on recovery, unconditionally resetting it to
+  0. A multi-node cluster never noticed — a restarted node's very next
+  `AppendEntries` from an active leader re-establishes it via
+  `LeaderCommit` before anything else can observe the gap — but it's
+  wrong for a single-node cluster, or any node that becomes leader
+  again before hearing from anyone else, and a snapshot's entire
+  meaning ("this index is committed") depends on it being right
+  immediately. Fixed narrowly: restore `commitIndex` to at least the
+  snapshot boundary, provably safe regardless of cluster size, without
+  trying to also solve the separate, larger question of full
+  `commitIndex` recovery for entries beyond it.
+- **Sorted-key assumption violated by its own producer.** The very
+  first test combining data from more than one source (the memtable
+  and a flushed SSTable together) failed immediately: `Snapshot`
+  gathers keys via a Go map internally, whose iteration order is
+  randomized, but the SSTable writer it hands them to requires strictly
+  sorted input. Fixed with an explicit sort right before the write —
+  caught by the first test that exercised more than a single data
+  source, not by code review.
 
 ## Benchmark results
 
@@ -357,9 +415,6 @@ cluster.
 
 ## Known limitations / possible future work
 
-- **No log compaction / snapshotting**: the Raft log grows unboundedly;
-  a new or long-partitioned node replays the whole log rather than
-  installing a snapshot.
 - **Async flush bounds itself to one flush in flight at a time**: a
   concurrent write that arrives while a flush is already running waits
   for it to finish rather than starting a second one. Simpler to reason
@@ -368,6 +423,12 @@ cluster.
   see [`bench/BENCHMARKS.md`](bench/BENCHMARKS.md) for the real numbers,
   both where the design clearly wins and where this bound's cost shows
   up.
+- **Snapshotting builds its SSTable by gathering every distinct key and
+  calling `Get` per key**, not a proper k-way merge across the memtable
+  and every SSTable — simpler, and reuses `Get`'s own already-correct
+  logic, at the cost of being less time- and space-efficient than a
+  merge for a much larger dataset than this project's scope actually
+  needs to handle.
 
 ## Project layout
 

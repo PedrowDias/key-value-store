@@ -62,7 +62,7 @@ func startFailoverCluster(t testing.TB, n int, basePort int) []*failoverNode {
 		}
 
 		dir := t.TempDir()
-		rn, err := raft.OpenNode(raft.Config{
+		rn, _, err := raft.OpenNode(raft.Config{
 			ID: id, Peers: peers,
 			ElectionTick: failoverElectionTicks, HeartbeatTick: failoverHeartbeatTick,
 		}, filepath.Join(dir, "raft.wal"))

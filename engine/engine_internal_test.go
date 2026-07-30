@@ -332,10 +332,26 @@ func TestOpen_WALOpenErrorPropagates(t *testing.T) {
 	}
 }
 
+func TestOpen_RestoreMarkerErrorPropagates(t *testing.T) {
+	dir := tempDir(t)
+	// Make the marker's own path a directory rather than a file, so
+	// reading it fails with something other than "not exist."
+	if err := os.Mkdir(filepath.Join(dir, restoreMarkerFileName), 0755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Open(Options{Dir: dir})
+	if err == nil {
+		t.Fatal("expected Open to propagate a restore marker read error")
+	}
+	if !strings.Contains(err.Error(), "restore marker") {
+		t.Fatalf("error = %v, want it to mention the restore marker", err)
+	}
+}
+
 // --- discoverSSTables, direct and closeAll with real entries ---------------
 
 func TestDiscoverSSTables_ReadDirErrorOnNonexistentPath(t *testing.T) {
-	_, _, _, err := discoverSSTables(filepath.Join(t.TempDir(), "does-not-exist"), sstable.NewBlockCache(defaultBlockCacheSize))
+	_, _, _, err := discoverSSTables(filepath.Join(t.TempDir(), "does-not-exist"), sstable.NewBlockCache(defaultBlockCacheSize), 0)
 	if err == nil {
 		t.Fatal("expected an error listing a nonexistent directory")
 	}
@@ -527,7 +543,7 @@ func TestApplyBatch_ClosedWhileWaitingForFlushReturnsError(t *testing.T) {
 // --- discoverWALs, direct -----------------------------------------------------
 
 func TestDiscoverWALs_ReadDirErrorOnNonexistentPath(t *testing.T) {
-	_, _, err := discoverWALs(filepath.Join(t.TempDir(), "does-not-exist"))
+	_, _, err := discoverWALs(filepath.Join(t.TempDir(), "does-not-exist"), 0)
 	if err == nil {
 		t.Fatal("expected an error listing a nonexistent directory")
 	}
@@ -541,7 +557,7 @@ func TestDiscoverWALs_IgnoresFilenameNotMatchingPatternExactly(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "000001.wal.bak"), []byte("x"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	paths, nextWALSeq, err := discoverWALs(dir)
+	paths, nextWALSeq, err := discoverWALs(dir, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

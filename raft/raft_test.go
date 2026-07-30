@@ -849,13 +849,15 @@ func TestRole_String(t *testing.T) {
 
 func TestMessageType_String(t *testing.T) {
 	cases := map[MessageType]string{
-		MsgPreVote:               "PreVote",
-		MsgPreVoteResponse:       "PreVoteResponse",
-		MsgRequestVote:           "RequestVote",
-		MsgRequestVoteResponse:   "RequestVoteResponse",
-		MsgAppendEntries:         "AppendEntries",
-		MsgAppendEntriesResponse: "AppendEntriesResponse",
-		MessageType(99):          "Unknown",
+		MsgPreVote:                 "PreVote",
+		MsgPreVoteResponse:         "PreVoteResponse",
+		MsgRequestVote:             "RequestVote",
+		MsgRequestVoteResponse:     "RequestVoteResponse",
+		MsgAppendEntries:           "AppendEntries",
+		MsgAppendEntriesResponse:   "AppendEntriesResponse",
+		MsgInstallSnapshot:         "InstallSnapshot",
+		MsgInstallSnapshotResponse: "InstallSnapshotResponse",
+		MessageType(99):            "Unknown",
 	}
 	for typ, want := range cases {
 		if got := typ.String(); got != want {

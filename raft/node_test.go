@@ -7,7 +7,7 @@ import (
 
 func openTestNode(t *testing.T, cfg Config, path string) *Node {
 	t.Helper()
-	n, err := OpenNode(cfg, path)
+	n, _, err := OpenNode(cfg, path)
 	if err != nil {
 		t.Fatalf("OpenNode: %v", err)
 	}
@@ -23,7 +23,7 @@ func TestNode_SingleNodeBecomesLeaderAndPersists(t *testing.T) {
 
 	for i := 0; i < 20; i++ {
 		n.Tick()
-		if _, _, err := n.Persist(); err != nil {
+		if _, _, _, err := n.Persist(); err != nil {
 			t.Fatalf("Persist: %v", err)
 		}
 	}
@@ -44,7 +44,7 @@ func TestNode_ProposeAndPersistCommitsInSingleNodeCluster(t *testing.T) {
 	if err := n.Propose([]byte("hello")); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := n.Persist(); err != nil {
+	if _, _, _, err := n.Persist(); err != nil {
 		t.Fatal(err)
 	}
 	if n.Status().CommitIndex != 1 {
@@ -72,7 +72,7 @@ func TestNode_ProposeBatchCommitsAllInSingleNodeCluster(t *testing.T) {
 	if len(indices) != 3 || indices[0] != 1 || indices[1] != 2 || indices[2] != 3 {
 		t.Fatalf("indices = %v, want [1 2 3]", indices)
 	}
-	if _, _, err := n.Persist(); err != nil {
+	if _, _, _, err := n.Persist(); err != nil {
 		t.Fatal(err)
 	}
 	if n.Status().CommitIndex != 3 {
@@ -96,7 +96,7 @@ func TestNode_RequestReadIndexConfirmsImmediatelyInSingleNodeCluster(t *testing.
 	if err := n.RequestReadIndex(7); err != nil {
 		t.Fatal(err)
 	}
-	_, readStates, err := n.Persist()
+	_, readStates, _, err := n.Persist()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +181,7 @@ func TestNode_TwoNodeClusterReplicatesAndPersists(t *testing.T) {
 
 	nodes := map[uint64]*Node{1: n1, 2: n2}
 	pump := func(id uint64) {
-		msgs, _, err := nodes[id].Persist()
+		msgs, _, _, err := nodes[id].Persist()
 		if err != nil {
 			t.Fatalf("node %d Persist: %v", id, err)
 		}
@@ -224,7 +224,7 @@ func TestNode_PersistPropagatesHardStateSaveError(t *testing.T) {
 	// save failure.
 	n.storage.w.Close()
 
-	if _, _, err := n.Persist(); err == nil {
+	if _, _, _, err := n.Persist(); err == nil {
 		t.Fatal("expected Persist to propagate a HardState save error")
 	}
 }
@@ -237,7 +237,7 @@ func TestNode_PersistPropagatesEntriesSaveError(t *testing.T) {
 	n.r.Propose([]byte("x")) // dirties the log without going through Persist yet
 	n.storage.w.Close()      // force the entries save to fail
 
-	if _, _, err := n.Persist(); err == nil {
+	if _, _, _, err := n.Persist(); err == nil {
 		t.Fatal("expected Persist to propagate an entries save error")
 	}
 }
@@ -246,7 +246,7 @@ func TestNode_PersistPropagatesEntriesSaveError(t *testing.T) {
 
 func TestOpenNode_StorageErrorPropagates(t *testing.T) {
 	dir := t.TempDir() // a directory, not a file: OpenStorage's Replay call fails
-	_, err := OpenNode(Config{ID: 1, ElectionTick: 10, HeartbeatTick: 1}, dir)
+	_, _, err := OpenNode(Config{ID: 1, ElectionTick: 10, HeartbeatTick: 1}, dir)
 	if err == nil {
 		t.Fatal("expected an error when storage fails to open")
 	}
@@ -254,7 +254,7 @@ func TestOpenNode_StorageErrorPropagates(t *testing.T) {
 
 func TestOpenNode_InvalidConfigClosesStorageAndPropagates(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "node.wal")
-	_, err := OpenNode(Config{ID: 0, ElectionTick: 10, HeartbeatTick: 1}, path) // invalid: zero ID
+	_, _, err := OpenNode(Config{ID: 0, ElectionTick: 10, HeartbeatTick: 1}, path) // invalid: zero ID
 	if err == nil {
 		t.Fatal("expected an error for an invalid Config")
 	}

@@ -58,9 +58,10 @@ type raftNode interface {
 	Propose(data []byte) error
 	ProposeBatch(datas [][]byte) ([]uint64, error)
 	RequestReadIndex(ctx uint64) error
+	CreateSnapshot(index uint64, data []byte) error
 	Status() raft.Status
 	Entries(start, end uint64) []raft.LogEntry
-	Persist() ([]raft.Message, []raft.ReadState, error)
+	Persist() ([]raft.Message, []raft.ReadState, *raft.Snapshot, error)
 }
 
 // Server runs one node's full participation in the cluster: driving its
@@ -111,6 +112,16 @@ type Server struct {
 	// other goroutine.
 	lastApplied uint64
 	waiters     map[uint64]pendingPropose
+
+	// snapshotThreshold is how many entries must have been applied
+	// since the last snapshot (local or received) before Run
+	// automatically triggers a new one — see maybeSnapshot's own doc.
+	// lastSnapshotIndex tracks the boundary of that most recent
+	// snapshot, local or received, so the threshold check has
+	// something to measure forward progress against. Zero
+	// snapshotThreshold disables automatic snapshotting entirely.
+	snapshotThreshold int
+	lastSnapshotIndex uint64
 
 	// pendingReadIndexes and nextReadCtx are also Run-goroutine-only —
 	// see LinearizableGet's doc for the full protocol. nextReadCtx is a
@@ -165,6 +176,16 @@ const proposeChBufferSize = 256
 const (
 	defaultBatchWindow  = 500 * time.Microsecond
 	defaultMaxBatchSize = 64
+	// defaultSnapshotThreshold is how many entries accumulate (since
+	// the last snapshot, local or received) before Run automatically
+	// triggers a new one — see maybeSnapshot's own doc. Deliberately a
+	// conservative starting point rather than claimed-optimal, same as
+	// the batching defaults above: a real deployment would want to
+	// tune this against its own workload's write rate and how large a
+	// snapshot the underlying dataset actually produces —
+	// SetSnapshotThreshold exists for exactly that. Zero disables
+	// automatic snapshotting entirely.
+	defaultSnapshotThreshold = 10000
 )
 
 // New constructs a Server. tr and eng are assumed already open; Server
@@ -179,6 +200,7 @@ func New(node raftNode, tr *transport.Transport, eng *engine.Engine, tickInterva
 		tickInterval:       tickInterval,
 		batchWindow:        defaultBatchWindow,
 		maxBatchSize:       defaultMaxBatchSize,
+		snapshotThreshold:  defaultSnapshotThreshold,
 		proposeCh:          make(chan proposeRequest, proposeChBufferSize),
 		readIndexCh:        make(chan readIndexRequest, proposeChBufferSize),
 		stopCh:             make(chan struct{}),
@@ -201,6 +223,31 @@ func (s *Server) SetBatchWindow(d time.Duration) { s.batchWindow = d }
 // SetBatchWindow. Must be called before Run(), for the same reason as
 // SetBatchWindow.
 func (s *Server) SetMaxBatchSize(n int) { s.maxBatchSize = n }
+
+// SetSnapshotThreshold overrides the default automatic-snapshot trigger
+// (see Server.snapshotThreshold's doc). Must be called before Run(),
+// for the same reason as SetBatchWindow. A value of 0 disables
+// automatic snapshotting entirely — CreateSnapshot could still be
+// triggered some other way if this project ever added one, but nothing
+// currently does.
+func (s *Server) SetSnapshotThreshold(n int) { s.snapshotThreshold = n }
+
+// SeedAppliedIndex tells Server that state up through index is already
+// reflected in eng (the one passed to New) — used exactly once, at
+// startup, when a previously-persisted snapshot was found and restored
+// into the engine before Server was even constructed (see
+// cmd/kvstore's buildComponents). Without this, applyCommitted would
+// try to re-apply entries starting from index 0, which not only
+// duplicates work already reflected in the restored engine state but
+// would fail outright: this node's own raft log no longer has that
+// history to replay — it's exactly what the snapshot superseded. Must
+// be called before Run(), and only when index is genuinely already
+// applied; calling it with a stale or wrong value would silently skip
+// applying real entries.
+func (s *Server) SeedAppliedIndex(index uint64) {
+	s.lastApplied = index
+	s.lastSnapshotIndex = index
+}
 
 // Run drives the server's event loop until Stop is called. Intended to
 // be run in its own goroutine: `go srv.Run()`.
@@ -346,7 +393,7 @@ func (s *Server) Stop() {
 // Step, and Propose, which is the discipline raft.Node's documentation
 // requires.
 func (s *Server) pump() {
-	msgs, readStates, err := s.node.Persist()
+	msgs, readStates, snapshotToApply, err := s.node.Persist()
 	if err != nil {
 		// A persist failure means this node can no longer safely
 		// participate (its durability guarantees are broken) — there's
@@ -358,6 +405,29 @@ func (s *Server) pump() {
 		fmt.Printf("server: persist error, node may be unsafe to continue: %v\n", err)
 		return
 	}
+	if snapshotToApply != nil {
+		// This node just installed a snapshot received from a leader —
+		// raft.Node's own log/commitIndex already reflect it (and that
+		// was already made durable inside the Persist() call above).
+		// Restoring the actual engine.Engine state from it happens
+		// here, BEFORE applyCommitted runs below: lastApplied must
+		// already reflect the snapshot's boundary by the time
+		// applyCommitted asks for entries starting there, since this
+		// node's own raft log no longer has earlier history to replay
+		// — it's exactly what the snapshot superseded. A failure here
+		// is intentionally non-fatal and simply retried: raft.Node
+		// will report the same persisted snapshot again on the very
+		// next restart (OpenNode re-reads it from durable storage
+		// independent of any in-memory "already reported" tracking),
+		// so there's no permanent inconsistency risk, only a delay
+		// until the engine catches up.
+		if err := s.eng.RestoreSnapshot(snapshotToApply.Data); err != nil {
+			fmt.Printf("server: failed to restore a received snapshot (index %d) into the engine, will retry on next restart: %v\n", snapshotToApply.LastIncludedIndex, err)
+		} else {
+			s.lastApplied = snapshotToApply.LastIncludedIndex
+			s.lastSnapshotIndex = snapshotToApply.LastIncludedIndex
+		}
+	}
 	for _, m := range msgs {
 		// Best-effort: Transport itself doesn't retry, and neither do
 		// we here — a dropped message just means Raft's own timeout/
@@ -366,6 +436,7 @@ func (s *Server) pump() {
 		s.tr.Send(m)
 	}
 	s.applyCommitted()
+	s.maybeSnapshot()
 
 	// Resolve any ReadIndex requests a majority just confirmed. The
 	// ReadIndex protocol's other half — waiting for this node's own
@@ -492,6 +563,45 @@ func decodeAndValidateCommand(entry raft.LogEntry) (command, error) {
 		return command{}, fmt.Errorf("server: unknown command type %d in entry %d", cmd.Type, entry.Index)
 	}
 	return cmd, nil
+}
+
+// maybeSnapshot triggers a new snapshot once enough entries have
+// accumulated since the last one (local or received) — see
+// Server.snapshotThreshold's doc for the threshold itself. Called after
+// every applyCommitted, so the check always runs against this node's
+// latest locally-applied state, not a stale one.
+//
+// A failure taking or persisting a snapshot is intentionally
+// non-fatal: this node simply tries again on a later call once more
+// entries have accumulated (or, in practice, likely resolves itself —
+// e.g. a transient engine.Snapshot error from a race with something
+// else, or a raft.Node.CreateSnapshot rejection because the target
+// index briefly isn't committed yet, which the next attempt at a
+// higher index won't hit). The log growing somewhat larger than
+// intended in the meantime is a performance concern, not a correctness
+// one.
+func (s *Server) maybeSnapshot() {
+	if s.snapshotThreshold <= 0 {
+		return
+	}
+	if s.lastApplied <= s.lastSnapshotIndex {
+		return
+	}
+	if s.lastApplied-s.lastSnapshotIndex < uint64(s.snapshotThreshold) {
+		return
+	}
+
+	index := s.lastApplied
+	data, err := s.eng.Snapshot()
+	if err != nil {
+		fmt.Printf("server: failed to take an engine snapshot at index %d: %v\n", index, err)
+		return
+	}
+	if err := s.node.CreateSnapshot(index, data); err != nil {
+		fmt.Printf("server: failed to create a raft snapshot at index %d: %v\n", index, err)
+		return
+	}
+	s.lastSnapshotIndex = index
 }
 
 // applyEntry decodes and applies a single committed entry to the engine.

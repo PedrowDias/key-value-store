@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -10,6 +11,9 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/PedrowDias/key-value-store/engine"
+	"github.com/PedrowDias/key-value-store/raft"
 )
 
 // --- parseArgs ---------------------------------------------------------------
@@ -32,7 +36,7 @@ func TestParseArgs_WithPeersAndTuning(t *testing.T) {
 		"-id=1", "-raft-addr=127.0.0.1:7001", "-http-addr=127.0.0.1:8001",
 		"-peers=2=127.0.0.1:7002,3=127.0.0.1:7003",
 		"-data-dir=/tmp/somedir", "-election-ticks=20", "-heartbeat-ticks=2",
-		"-tick-interval=50ms",
+		"-tick-interval=50ms", "-snapshot-threshold=5",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -45,6 +49,9 @@ func TestParseArgs_WithPeersAndTuning(t *testing.T) {
 	}
 	if cfg.tickInterval != 50*time.Millisecond {
 		t.Fatalf("tickInterval = %v, want 50ms", cfg.tickInterval)
+	}
+	if cfg.snapshotThreshold != 5 {
+		t.Fatalf("snapshotThreshold = %d, want 5", cfg.snapshotThreshold)
 	}
 }
 
@@ -196,13 +203,121 @@ func testConfig(t *testing.T, id uint64) config {
 
 func TestBuildComponents_Success(t *testing.T) {
 	cfg := testConfig(t, 1)
-	rn, tr, eng, err := buildComponents(cfg)
+	rn, tr, eng, _, err := buildComponents(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { tr.Close(); rn.Close(); eng.Close() }()
 	if rn == nil || tr == nil || eng == nil {
 		t.Fatal("expected all three components to be non-nil")
+	}
+}
+
+// TestBuildComponents_PersistedSnapshotOnStartupWarns seeds a real
+// persisted snapshot at the exact path buildComponents itself will open
+// (simulating a previous run that had already compacted its log), then
+// calls buildComponents fresh (simulating a restart) — which today
+// should reach and pass through the "snapshot exists but can't yet be
+// restored into the engine" warning branch without erroring, rather
+// than silently ignoring the snapshot's existence. See buildComponents'
+// own TODO comment for why actually restoring it isn't implemented yet.
+func TestBuildComponents_RestoresPersistedSnapshotOnStartup(t *testing.T) {
+	cfg := testConfig(t, 1)
+	raftWALPath := filepath.Join(cfg.dataDir, "raft.wal")
+
+	// Generate valid snapshot bytes the same way a real one would be
+	// produced: from a real engine's own Snapshot() call.
+	sourceEng, err := engine.Open(engine.Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sourceEng.Put([]byte("seeded-key"), []byte("seeded-value")); err != nil {
+		t.Fatal(err)
+	}
+	snapData, err := sourceEng.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceEng.Close()
+
+	seedNode, _, err := raft.OpenNode(raft.Config{ID: cfg.id, ElectionTick: cfg.electionTicks, HeartbeatTick: cfg.heartbeatTicks}, raftWALPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20; i++ {
+		seedNode.Tick()
+		seedNode.Persist()
+	}
+	if err := seedNode.Propose([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := seedNode.Persist(); err != nil {
+		t.Fatal(err)
+	}
+	if err := seedNode.CreateSnapshot(1, snapData); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := seedNode.Persist(); err != nil {
+		t.Fatal(err)
+	}
+	if err := seedNode.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rn, tr, eng, appliedIndex, err := buildComponents(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { tr.Close(); rn.Close(); eng.Close() }()
+	if rn == nil || tr == nil || eng == nil {
+		t.Fatal("expected all three components to be non-nil")
+	}
+	if appliedIndex != 1 {
+		t.Fatalf("appliedIndex = %d, want 1 (the persisted snapshot's LastIncludedIndex)", appliedIndex)
+	}
+	val, found, err := eng.Get([]byte("seeded-key"))
+	if err != nil || !found || string(val) != "seeded-value" {
+		t.Fatalf("seeded-key = %q found=%v err=%v, want seeded-value true nil — the persisted snapshot should have been restored into the engine", val, found, err)
+	}
+}
+
+func TestBuildComponents_MalformedPersistedSnapshotFailsStartup(t *testing.T) {
+	// The other side of the same behavior: if restoring the persisted
+	// snapshot into the engine fails, buildComponents must refuse to
+	// start rather than silently proceed with incomplete data (unlike
+	// server.pump's own retry-later handling for a LIVE node — this one
+	// hasn't started participating at all yet).
+	cfg := testConfig(t, 1)
+	raftWALPath := filepath.Join(cfg.dataDir, "raft.wal")
+
+	seedNode, _, err := raft.OpenNode(raft.Config{ID: cfg.id, ElectionTick: cfg.electionTicks, HeartbeatTick: cfg.heartbeatTicks}, raftWALPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20; i++ {
+		seedNode.Tick()
+		seedNode.Persist()
+	}
+	if err := seedNode.Propose([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := seedNode.Persist(); err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately malformed: not valid length-prefixed snapshot data.
+	if err := seedNode.CreateSnapshot(1, []byte("not-valid-snapshot-data")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := seedNode.Persist(); err != nil {
+		t.Fatal(err)
+	}
+	if err := seedNode.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, _, _, err = buildComponents(cfg)
+	if err == nil {
+		t.Fatal("expected buildComponents to fail rather than start with a snapshot it couldn't restore")
 	}
 }
 
@@ -213,7 +328,7 @@ func TestBuildComponents_DataDirIsFileFailsAtMkdir(t *testing.T) {
 
 	cfg := testConfig(t, 1)
 	cfg.dataDir = filepath.Join(blocker, "sub") // parent path component is a file
-	_, _, _, err := buildComponents(cfg)
+	_, _, _, _, err := buildComponents(cfg)
 	if err == nil {
 		t.Fatal("expected an error when the data directory's parent is a regular file")
 	}
@@ -221,7 +336,7 @@ func TestBuildComponents_DataDirIsFileFailsAtMkdir(t *testing.T) {
 
 func TestBuildComponents_RaftOpenNodeErrorPropagates(t *testing.T) {
 	cfg := testConfig(t, 0) // invalid: zero ID makes raft.OpenNode fail
-	_, _, _, err := buildComponents(cfg)
+	_, _, _, _, err := buildComponents(cfg)
 	if err == nil {
 		t.Fatal("expected an error for an invalid raft Config")
 	}
@@ -239,7 +354,7 @@ func TestBuildComponents_TransportListenErrorClosesRaftNode(t *testing.T) {
 
 	cfg := testConfig(t, 1)
 	cfg.raftAddr = blocker.Addr().String() // already in use
-	_, _, _, err = buildComponents(cfg)
+	_, _, _, _, err = buildComponents(cfg)
 	if err == nil {
 		t.Fatal("expected an error when the raft address is already in use")
 	}
@@ -258,7 +373,7 @@ func TestBuildComponents_EngineOpenErrorClosesTransportAndRaftNode(t *testing.T)
 		t.Fatal(err)
 	}
 
-	_, _, _, err := buildComponents(cfg)
+	_, _, _, _, err := buildComponents(cfg)
 	if err == nil {
 		t.Fatal("expected an error when the engine's data directory is already a file")
 	}
@@ -358,6 +473,76 @@ func TestRunServer_ShutsDownOnStopSignal(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("runServer did not return after a stop signal")
+	}
+}
+
+func TestRunServer_SeedsAppliedIndexFromPersistedSnapshot(t *testing.T) {
+	cfg := testConfig(t, 1)
+	cfg.snapshotThreshold = 5 // exercise runServer's SetSnapshotThreshold branch too
+	raftWALPath := filepath.Join(cfg.dataDir, "raft.wal")
+
+	sourceEng, err := engine.Open(engine.Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sourceEng.Put([]byte("seeded-key"), []byte("seeded-value")); err != nil {
+		t.Fatal(err)
+	}
+	snapData, err := sourceEng.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceEng.Close()
+
+	seedNode, _, err := raft.OpenNode(raft.Config{ID: cfg.id, ElectionTick: cfg.electionTicks, HeartbeatTick: cfg.heartbeatTicks}, raftWALPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20; i++ {
+		seedNode.Tick()
+		seedNode.Persist()
+	}
+	if err := seedNode.Propose([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := seedNode.Persist(); err != nil {
+		t.Fatal(err)
+	}
+	if err := seedNode.CreateSnapshot(1, snapData); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := seedNode.Persist(); err != nil {
+		t.Fatal(err)
+	}
+	if err := seedNode.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ln, err := net.Listen("tcp", cfg.httpAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopCh := make(chan os.Signal, 1)
+	readyCh := make(chan string, 1)
+	errCh := make(chan error, 1)
+	go func() { errCh <- runServer(cfg, ln, stopCh, readyCh) }()
+	defer func() {
+		stopCh <- fakeSignal{name: "test-signal"}
+		<-errCh
+	}()
+
+	addr := <-readyCh
+	resp, err := http.Get("http://" + addr + "/kv/seeded-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET seeded-key status = %d, want 200 — the persisted snapshot should have been restored and applied on startup", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "seeded-value" {
+		t.Fatalf("GET seeded-key body = %q, want seeded-value", body)
 	}
 }
 

@@ -2,6 +2,7 @@ package raft
 
 import (
 	"errors"
+	"fmt"
 	"math/rand"
 )
 
@@ -111,6 +112,28 @@ type Ready struct {
 	// the read it was tracking on behalf of Context with a
 	// linearizability guarantee.
 	ReadStates []ReadState
+
+	// Snapshot is non-nil exactly once, right after this node's own
+	// snapshot boundary changes — either from a local CreateSnapshot
+	// call, or from installing one received via InstallSnapshot from a
+	// leader. Either way, it's what the storage layer needs to persist
+	// (replacing whatever log entries it previously had at or before
+	// LastIncludedIndex with this snapshot instead). Unlike
+	// UnstableEntries, this represents entries being permanently
+	// discarded, not new ones being added — the storage layer's
+	// response to seeing this should be "delete what you had up through
+	// here, remember this snapshot as the new baseline," not "append."
+	Snapshot *Snapshot
+
+	// SnapshotToApply is non-nil only when this node just installed a
+	// snapshot RECEIVED from a leader (never for a local CreateSnapshot
+	// call, which by definition means the application already has this
+	// data — it's the one that produced it). Distinct from Snapshot
+	// above, which is purely a storage-layer persistence concern: this
+	// is the signal the actual application needs — restore your own
+	// state machine from Data, since your own log history covering
+	// everything up to LastIncludedIndex no longer exists to replay.
+	SnapshotToApply *Snapshot
 }
 
 // tests, observability, and callers deciding where to route a proposal.
@@ -134,12 +157,31 @@ type Raft struct {
 	votedFor    uint64 // 0 = no vote cast this term
 	leaderID    uint64 // 0 = unknown
 
-	// log[0] is a dummy sentinel entry (Term 0, Index 0), so log[i].Index
-	// == i always holds with no special-casing at the boundary — a
-	// standard Raft implementation trick that keeps prevLogIndex==0 (the
-	// "before the first real entry") a valid, unremarkable case rather
-	// than one needing its own branch everywhere.
+	// log[0] is a dummy sentinel entry: initially (Term 0, Index 0)
+	// before any snapshot has ever been taken, or (Term
+	// snapshot.LastIncludedTerm, Index snapshot.LastIncludedIndex)
+	// after one — either way, log[i].Index == log[0].Index + i always
+	// holds (see logPos), generalizing the standard Raft implementation
+	// trick that keeps "the entry just before what I actually have" a
+	// valid, unremarkable case rather than needing its own branch
+	// everywhere, to also cover "everything before my last snapshot,"
+	// not just "the very beginning."
 	log []LogEntry
+
+	// snapshot is this node's own most recent local snapshot, if any
+	// (zero value — Data == nil — before the first CreateSnapshot call).
+	// Kept around so a peer that's fallen behind further than log[0]
+	// still covers can be sent InstallSnapshot with it directly, rather
+	// than needing to regenerate it or having lost the ability to catch
+	// that peer up at all.
+	snapshot Snapshot
+
+	// pendingSnapshotToApply is set by handleInstallSnapshot when this
+	// node just installed a snapshot received from a leader, surfaced
+	// via Ready().SnapshotToApply on the next call and cleared on
+	// Advance() — the same accumulate-then-drain pattern msgs/readStates
+	// already use.
+	pendingSnapshotToApply *Snapshot
 
 	commitIndex uint64
 	lastApplied uint64
@@ -150,10 +192,14 @@ type Raft struct {
 	// (handleAppendEntries truncating a bad suffix) can only ever LOWER
 	// unstableIndex, never raise it — entries once reported as unstable
 	// stay considered unstable until an Advance() call confirms them
-	// persisted.
-	stableTerm    uint64
-	stableVote    uint64
-	unstableIndex uint64
+	// persisted. stableSnapshotIndex is the LastIncludedIndex of the
+	// snapshot boundary as of the last Advance() call — CreateSnapshot
+	// changing r.snapshot.LastIncludedIndex beyond this is what tells
+	// Ready() a new local snapshot needs reporting to the storage layer.
+	stableTerm          uint64
+	stableVote          uint64
+	unstableIndex       uint64
+	stableSnapshotIndex uint64
 
 	// Leader-only volatile state (§5.3). Reset fresh on every transition
 	// into Leader; meaningless in any other role.
@@ -246,8 +292,26 @@ func New(cfg Config) (*Raft, error) {
 // restoreState seeds a freshly constructed Raft with previously persisted
 // state, before it starts ticking or stepping — used by the persistent
 // storage layer on recovery. entries, if non-empty, must include the
-// index-0 dummy sentinel entry (Term 0, Index 0) as log[0], matching
-// New()'s own invariant.
+// dummy sentinel entry as entries[0] (Index 0, Term 0 if no snapshot
+// was ever taken; otherwise the snapshot's own LastIncludedIndex/Term),
+// matching New()'s own invariant.
+//
+// commitIndex is restored to AT LEAST entries[0].Index — provably safe
+// regardless of cluster size, since a snapshot's entire meaning is "this
+// index, and everything before it, is committed." This is a genuine gap
+// this feature's own correctness depends on (previously, EVERY restart
+// reset commitIndex to 0 unconditionally, relying on a multi-node
+// cluster's next AppendEntries from an active leader to naturally
+// re-establish it — invisible in the common case, but wrong for a
+// single-node cluster, or any restarted node that becomes leader again
+// before hearing from anyone else). Deliberately NOT extended further:
+// entries beyond that boundary that happen to still be in the persisted
+// log are NOT assumed committed just because they're present — whether
+// they truly are is the separate, larger, pre-existing question of full
+// commitIndex recovery after a restart, which this fix doesn't attempt
+// to solve (a new leader still needs a current-term entry to also reach
+// majority before an old-term entry becomes safely committed, per the
+// existing Figure 8 rule in maybeAdvanceCommitIndex).
 func (r *Raft) restoreState(hs HardState, entries []LogEntry) {
 	r.currentTerm = hs.Term
 	r.votedFor = hs.Vote
@@ -255,6 +319,9 @@ func (r *Raft) restoreState(hs HardState, entries []LogEntry) {
 	r.stableVote = hs.Vote
 	if len(entries) > 0 {
 		r.log = entries
+	}
+	if r.log[0].Index > r.commitIndex {
+		r.commitIndex = r.log[0].Index
 	}
 	r.unstableIndex = r.lastLogIndex() + 1
 }
@@ -280,9 +347,14 @@ func (r *Raft) Ready() Ready {
 		rd.HardState = &HardState{Term: r.currentTerm, Vote: r.votedFor}
 	}
 	if r.lastLogIndex() >= r.unstableIndex {
-		rd.UnstableEntries = append([]LogEntry(nil), r.log[r.unstableIndex:]...)
+		rd.UnstableEntries = append([]LogEntry(nil), r.log[r.logPos(r.unstableIndex):]...)
 		rd.FirstUnstableIndex = r.unstableIndex
 	}
+	if r.snapshot.LastIncludedIndex > r.stableSnapshotIndex {
+		snap := r.snapshot
+		rd.Snapshot = &snap
+	}
+	rd.SnapshotToApply = r.pendingSnapshotToApply
 	return rd
 }
 
@@ -295,6 +367,8 @@ func (r *Raft) Advance() {
 	if r.lastLogIndex() >= r.unstableIndex {
 		r.unstableIndex = r.lastLogIndex() + 1
 	}
+	r.stableSnapshotIndex = r.snapshot.LastIncludedIndex
+	r.pendingSnapshotToApply = nil
 	r.msgs = nil
 	r.readStates = nil
 }
@@ -302,14 +376,58 @@ func (r *Raft) Advance() {
 // Entries returns the entries in (start, end] — i.e. after index start up
 // to and including index end — or nil if the range is empty or invalid.
 // Used by a caller applying newly committed entries to a state machine.
+// If start itself is before the current snapshot boundary (this node's
+// log has been compacted past what the caller is asking for), start is
+// silently clamped up to the boundary — this can only under-return
+// entries a caller genuinely needed to have from elsewhere (e.g. an
+// installed snapshot), never return something wrong.
 func (r *Raft) Entries(start, end uint64) []LogEntry {
 	if end > r.lastLogIndex() {
 		end = r.lastLogIndex()
 	}
+	if start < r.log[0].Index {
+		start = r.log[0].Index
+	}
 	if start >= end {
 		return nil
 	}
-	return append([]LogEntry(nil), r.log[start+1:end+1]...)
+	return append([]LogEntry(nil), r.log[r.logPos(start)+1:r.logPos(end)+1]...)
+}
+
+// CreateSnapshot compacts the log up through index: the caller (the
+// application driving this Raft instance) has taken its own snapshot of
+// everything as of index and is telling this Raft instance the entries
+// at or before it are no longer needed — data already reflects
+// everything they did. index must be no newer than commitIndex (can't
+// discard log history for something that isn't even safely committed
+// yet) and strictly newer than the existing snapshot boundary
+// (snapshotting "backward," or at the same point twice, is meaningless).
+//
+// The resulting local snapshot is kept (see the snapshot field's doc)
+// so a peer that's fallen behind further than what remains in the log
+// can be sent it directly the next time this node tries to replicate to
+// it, rather than a normal AppendEntries — see sendAppendEntries.
+func (r *Raft) CreateSnapshot(index uint64, data []byte) error {
+	if index > r.commitIndex {
+		return fmt.Errorf("raft: cannot snapshot index %d: not yet committed (commitIndex %d)", index, r.commitIndex)
+	}
+	if index <= r.log[0].Index {
+		return fmt.Errorf("raft: cannot snapshot index %d: not newer than the existing snapshot boundary %d", index, r.log[0].Index)
+	}
+
+	term := r.termAt(index)
+	pos := r.logPos(index)
+	newLog := make([]LogEntry, 0, len(r.log)-pos)
+	newLog = append(newLog, LogEntry{Index: index, Term: term})
+	newLog = append(newLog, r.log[pos+1:]...)
+	r.log = newLog
+
+	if r.unstableIndex <= index {
+		r.unstableIndex = index + 1
+	}
+
+	r.snapshot = Snapshot{LastIncludedIndex: index, LastIncludedTerm: term, Data: data}
+	return nil
 }
 
 // send queues an outbound message.
@@ -322,14 +440,35 @@ func (r *Raft) send(m Message) {
 func (r *Raft) lastLogIndex() uint64 { return r.log[len(r.log)-1].Index }
 func (r *Raft) lastLogTerm() uint64  { return r.log[len(r.log)-1].Term }
 
-// termAt returns the term of the entry at index, or 0 if index is out of
-// range (including index 0, the dummy sentinel, which legitimately has
-// term 0).
+// logPos translates a log Index into its position within r.log. Valid
+// only for index in [r.log[0].Index, lastLogIndex()] — callers outside
+// that range (typically: a peer has fallen behind further than this
+// node's own compacted log still covers) need InstallSnapshot instead of
+// a normal AppendEntries; see sendAppendEntries.
+//
+// This is what lets every other index-based access in this file work
+// unchanged whether or not a snapshot has ever been taken: before the
+// first CreateSnapshot call, r.log[0] is the original (Index 0, Term 0)
+// dummy sentinel and this is equivalent to direct indexing; after one,
+// r.log[0] becomes the snapshot boundary (Index = LastIncludedIndex,
+// Term = LastIncludedTerm) instead, and every access already goes
+// through here rather than assuming position == index directly.
+func (r *Raft) logPos(index uint64) int {
+	return int(index - r.log[0].Index)
+}
+
+// termAt returns the term of the entry at index, or 0 if index is
+// outside what this node's log currently covers — either because it's
+// beyond lastLogIndex (nothing there yet) or because it's before the
+// current snapshot boundary (already compacted away; the entry at
+// EXACTLY the boundary itself, r.log[0].Index, is still available and
+// returns its real term, which may be nonzero after a snapshot — only
+// strictly earlier indices return 0).
 func (r *Raft) termAt(index uint64) uint64 {
-	if index > r.lastLogIndex() {
+	if index < r.log[0].Index || index > r.lastLogIndex() {
 		return 0
 	}
-	return r.log[index].Term
+	return r.log[r.logPos(index)].Term
 }
 
 func (r *Raft) clusterSize() int { return len(r.peers) + 1 }
@@ -381,6 +520,10 @@ func (r *Raft) Step(m Message) {
 		r.handleAppendEntries(m)
 	case MsgAppendEntriesResponse:
 		r.handleAppendEntriesResponse(m)
+	case MsgInstallSnapshot:
+		r.handleInstallSnapshot(m)
+	case MsgInstallSnapshotResponse:
+		r.handleInstallSnapshotResponse(m)
 	}
 }
 
@@ -515,13 +658,33 @@ func (r *Raft) sendHeartbeats() {
 // path, which explicitly resets sentIndex first) correctly restart from
 // the authoritative acknowledged point instead of a stale optimistic one.
 //
+// If this peer's own acknowledged nextIndex-1 is now before what this
+// leader's (possibly compacted) log still covers, a normal AppendEntries
+// is no longer possible at all — there's no valid PrevLogIndex/Term to
+// offer — so InstallSnapshot is sent instead. This check deliberately
+// uses nextIndex, not the optimistic sentIndex floor above: getting a
+// multi-megabyte snapshot resend wrong (sending it again before really
+// needing to) is a much bigger cost than a normal entry's redundant
+// resend, so this path is intentionally more conservative — it keeps
+// resending the actual snapshot on every subsequent attempt until
+// nextIndex genuinely advances past it, rather than optimistically
+// assuming a single send landed.
+//
 // readContext, if nonzero, piggybacks a ReadIndex confirmation probe
 // onto this same message (see RequestReadIndex's doc) — reusing the
 // exact same AppendEntries a normal heartbeat or replication send would
 // produce, rather than a separate RPC, since "does this peer still ack
-// me as leader" is exactly what an ordinary AppendEntries round trip
-// already establishes.
+// me as leader" is exactly what an ordinary round trip already
+// establishes. A peer needing InstallSnapshot instead doesn't get this
+// probe piggybacked at all — a rare enough combination (a peer that far
+// behind, concurrently with an outstanding read) that another peer's ack
+// reaching the same majority is an acceptable simplification over adding
+// a second RPC shape just for this case.
 func (r *Raft) sendAppendEntries(peer uint64, readContext uint64) {
+	if r.nextIndex[peer]-1 < r.log[0].Index {
+		r.sendInstallSnapshot(peer)
+		return
+	}
 	prevIndex := r.nextIndex[peer] - 1
 	if r.sentIndex[peer] > prevIndex {
 		prevIndex = r.sentIndex[peer]
@@ -540,6 +703,25 @@ func (r *Raft) sendAppendEntries(peer uint64, readContext uint64) {
 	if r.lastLogIndex() > r.sentIndex[peer] {
 		r.sentIndex[peer] = r.lastLogIndex()
 	}
+}
+
+// sendInstallSnapshot sends this leader's current local snapshot to
+// peer directly — see sendAppendEntries's doc for when this is used
+// instead of a normal AppendEntries. Deliberately does not touch
+// sentIndex[peer] at all: unlike normal entries (reliably delivered, in
+// order, over one persistent connection — see the transport package),
+// this leader has no way to know whether a dropped connection or a
+// slow/lost response means the snapshot never actually arrived, so it
+// keeps resending the real snapshot on every subsequent attempt rather
+// than optimistically assuming it landed and only sending smaller
+// catch-up entries that a peer who never actually got the snapshot
+// could never make sense of.
+func (r *Raft) sendInstallSnapshot(peer uint64) {
+	r.send(Message{
+		Type:     MsgInstallSnapshot,
+		To:       peer,
+		Snapshot: r.snapshot,
+	})
 }
 
 // handlePreVote answers "if you asked for a real vote right now, would
@@ -664,7 +846,7 @@ func (r *Raft) handleAppendEntries(m Message) {
 				// log is wrong (came from a different, non-leader
 				// history) and must be discarded before appending the
 				// leader's version.
-				r.log = r.log[:idx]
+				r.log = r.log[:r.logPos(idx)]
 				if idx < r.unstableIndex {
 					r.unstableIndex = idx
 				}
@@ -727,6 +909,70 @@ func (r *Raft) handleAppendEntriesResponse(m Message) {
 	}
 	r.sentIndex[m.From] = 0
 	r.sendAppendEntries(m.From, 0)
+}
+
+// handleInstallSnapshot installs a snapshot received from a leader:
+// entirely replaces this node's log with a single new sentinel entry at
+// the snapshot's boundary — everything this node's own log used to have
+// is discarded, on the assumption that Data already reflects it (that's
+// the entire point of a snapshot). Surfaces the received Data via
+// Ready().SnapshotToApply so the actual application can restore its own
+// state machine from it — raft itself has no idea what Data even means,
+// only that log history covering it no longer needs to exist.
+func (r *Raft) handleInstallSnapshot(m Message) {
+	if m.Term < r.currentTerm {
+		r.send(Message{Type: MsgInstallSnapshotResponse, To: m.From, MatchIndex: r.log[0].Index})
+		return
+	}
+
+	// A valid InstallSnapshot at term >= ours means m.From is (or just
+	// became, in this term) the legitimate leader — same reasoning as
+	// handleAppendEntries.
+	r.becomeFollower(m.Term)
+	r.leaderID = m.From
+
+	if m.Snapshot.LastIncludedIndex <= r.log[0].Index {
+		// Stale or duplicate: we already have this snapshot boundary
+		// (or something newer) locally — most likely a retried send
+		// this node already processed. Ack with our OWN current
+		// boundary rather than reprocessing or regressing anything.
+		r.send(Message{Type: MsgInstallSnapshotResponse, To: m.From, MatchIndex: r.log[0].Index})
+		return
+	}
+
+	r.log = []LogEntry{{Index: m.Snapshot.LastIncludedIndex, Term: m.Snapshot.LastIncludedTerm}}
+	if m.Snapshot.LastIncludedIndex > r.commitIndex {
+		r.commitIndex = m.Snapshot.LastIncludedIndex
+	}
+	r.unstableIndex = m.Snapshot.LastIncludedIndex + 1
+	r.snapshot = m.Snapshot
+	r.pendingSnapshotToApply = &m.Snapshot
+
+	r.send(Message{Type: MsgInstallSnapshotResponse, To: m.From, MatchIndex: m.Snapshot.LastIncludedIndex})
+}
+
+// handleInstallSnapshotResponse updates this leader's replication
+// bookkeeping for a peer that just installed a snapshot — the same
+// nextIndex/matchIndex update a successful AppendEntriesResponse would
+// produce, just arrived at a different way. Subsequent sendAppendEntries
+// calls for this peer will naturally resume normal replication once
+// nextIndex-1 is back at or after this node's own log[0].Index.
+func (r *Raft) handleInstallSnapshotResponse(m Message) {
+	if m.Term > r.currentTerm {
+		r.becomeFollower(m.Term)
+		return
+	}
+	if m.Term < r.currentTerm || r.role != Leader {
+		return
+	}
+
+	if m.MatchIndex > r.matchIndex[m.From] {
+		r.matchIndex[m.From] = m.MatchIndex
+	}
+	if m.MatchIndex+1 > r.nextIndex[m.From] {
+		r.nextIndex[m.From] = m.MatchIndex + 1
+	}
+	r.maybeAdvanceCommitIndex()
 }
 
 // maybeAdvanceCommitIndex implements the Raft paper's §5.4.2 safety rule:

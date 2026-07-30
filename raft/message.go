@@ -74,6 +74,8 @@ const (
 	MsgRequestVoteResponse
 	MsgAppendEntries
 	MsgAppendEntriesResponse
+	MsgInstallSnapshot
+	MsgInstallSnapshotResponse
 )
 
 func (t MessageType) String() string {
@@ -90,6 +92,10 @@ func (t MessageType) String() string {
 		return "AppendEntries"
 	case MsgAppendEntriesResponse:
 		return "AppendEntriesResponse"
+	case MsgInstallSnapshot:
+		return "InstallSnapshot"
+	case MsgInstallSnapshotResponse:
+		return "InstallSnapshotResponse"
 	default:
 		return "Unknown"
 	}
@@ -133,6 +139,15 @@ type Message struct {
 	// Zero means "no read confirmation being requested," an ordinary
 	// AppendEntries or heartbeat.
 	ReadContext uint64
+
+	// InstallSnapshot request field: the snapshot being sent to a peer
+	// that's fallen behind further than this leader's own (compacted)
+	// log still covers. InstallSnapshotResponse reuses MatchIndex above
+	// (set to the snapshot's LastIncludedIndex once installed) rather
+	// than needing a field of its own — the same meaning an
+	// AppendEntriesResponse's MatchIndex already has, just arrived at a
+	// different way.
+	Snapshot Snapshot
 }
 
 // ReadState reports that a pending ReadIndex request (see
@@ -143,4 +158,20 @@ type Message struct {
 type ReadState struct {
 	Index   uint64
 	Context uint64
+}
+
+// Snapshot is a point-in-time snapshot of the replicated state machine.
+// Data is entirely opaque to Raft itself — whatever bytes the
+// application (the actual thing being replicated, outside this package
+// entirely) produced and knows how to restore its own state from later.
+// LastIncludedIndex/LastIncludedTerm record which log entry this
+// snapshot covers up through: once installed (by CreateSnapshot
+// locally, or InstallSnapshot on a lagging peer), every entry at or
+// before that index is gone from the log for good — Data is assumed to
+// already reflect everything they did, which is the entire point of
+// taking a snapshot in the first place.
+type Snapshot struct {
+	LastIncludedIndex uint64
+	LastIncludedTerm  uint64
+	Data              []byte
 }

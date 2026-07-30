@@ -64,10 +64,14 @@
 package engine
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/PedrowDias/key-value-store/memtable"
@@ -78,6 +82,18 @@ import (
 const (
 	walFileNamePattern     = "%06d.wal"
 	sstableFileNamePattern = "%06d.sst"
+	// restoreMarkerFileName names the small text file that coordinates
+	// RestoreSnapshot's atomic switch to entirely new data: its
+	// presence and content (a single integer, the minimum sequence
+	// number still valid) is what discoverSSTables/discoverWALs filter
+	// against, treating anything below it as already gone — superseded
+	// by a restored snapshot — whether or not it's actually been
+	// removed from disk yet. Written via write-to-temp-then-rename
+	// (see writeRestoreMarkerAtomically), the same safe pattern this
+	// project already uses for raft's own compaction: that atomic
+	// write is RestoreSnapshot's real commit point, not the separate,
+	// best-effort cleanup of the files it supersedes afterward.
+	restoreMarkerFileName  = "RESTORE_MARKER"
 	defaultMemtableSizeMax = 4 * 1024 * 1024 // 4 MiB
 	defaultBlockCacheSize  = 8 * 1024 * 1024 // 8 MiB
 )
@@ -222,14 +238,25 @@ func Open(opts Options) (*Engine, error) {
 		return nil, fmt.Errorf("engine: creating directory %s: %w", opts.Dir, err)
 	}
 
-	cache := sstable.NewBlockCache(opts.BlockCacheSize)
-
-	sstables, nextFlushSeq, maxSeqFromTables, err := discoverSSTables(opts.Dir, cache)
+	minValidSeq, err := readRestoreMarker(opts.Dir)
 	if err != nil {
 		return nil, err
 	}
 
-	walPaths, nextWALSeq, err := discoverWALs(opts.Dir)
+	cache := sstable.NewBlockCache(opts.BlockCacheSize)
+
+	sstables, nextFlushSeq, maxSeqFromTables, err := discoverSSTables(opts.Dir, cache, minValidSeq)
+	if err != nil {
+		// Accepted gap: MkdirAll and readRestoreMarker just succeeded
+		// against this same directory, so making discoverSSTables's
+		// own os.ReadDir specifically fail here needs the directory to
+		// become unreadable in the narrow window since — the same
+		// class of untestable OS-level branch as discoverWALs's
+		// matching comment just below explains.
+		return nil, err
+	}
+
+	walPaths, nextWALSeq, err := discoverWALs(opts.Dir, minValidSeq)
 	if err != nil {
 		// Accepted gap: discoverSSTables just scanned this same
 		// directory successfully, so making discoverWALs specifically
@@ -330,7 +357,12 @@ func Open(opts Options) (*Engine, error) {
 // newest-first, along with the flush-sequence number to use for the
 // next new SSTable and the highest MaxSeq among them (used to resume
 // sequence-number allocation after a restart).
-func discoverSSTables(dir string, cache *sstable.BlockCache) (sstables []*sstableEntry, nextFlushSeq int, maxSeq uint64, err error) {
+// discoverSSTables scans dir for existing "NNNNNN.sst" files with
+// sequence number >= minValidSeq (pass 0 for no filtering) — anything
+// below that threshold is treated as already gone, superseded by a
+// restored snapshot (see the RestoreSnapshot / restoreMarkerFileName
+// doc), whether or not it's actually been removed from disk yet.
+func discoverSSTables(dir string, cache *sstable.BlockCache, minValidSeq int) (sstables []*sstableEntry, nextFlushSeq int, maxSeq uint64, err error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, 0, 0, fmt.Errorf("engine: listing %s: %w", dir, err)
@@ -348,6 +380,9 @@ func discoverSSTables(dir string, cache *sstable.BlockCache) (sstables []*sstabl
 		}
 		if fmt.Sprintf(sstableFileNamePattern, n) != de.Name() {
 			continue // e.g. "000001.sst.bak" would otherwise Sscanf-match the prefix
+		}
+		if n < minValidSeq {
+			continue
 		}
 		nums = append(nums, n)
 		numToName[n] = de.Name()
@@ -379,7 +414,13 @@ func discoverSSTables(dir string, cache *sstable.BlockCache) (sstables []*sstabl
 // their full paths in ascending (oldest-first) file-number order — the
 // order they must be replayed in — along with the WAL-sequence number to
 // use for the next new one.
-func discoverWALs(dir string) (paths []string, nextWALSeq int, err error) {
+// discoverWALs scans dir for existing "NNNNNN.wal" files with sequence
+// number >= minValidSeq (pass 0 for no filtering — see
+// discoverSSTables's matching doc for why this filter exists) and
+// returns their full paths in ascending (oldest-first) file-number
+// order — the order they must be replayed in — along with the WAL-
+// sequence number to use for the next new one.
+func discoverWALs(dir string, minValidSeq int) (paths []string, nextWALSeq int, err error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, 0, fmt.Errorf("engine: listing %s: %w", dir, err)
@@ -398,6 +439,9 @@ func discoverWALs(dir string) (paths []string, nextWALSeq int, err error) {
 		if fmt.Sprintf(walFileNamePattern, n) != de.Name() {
 			continue
 		}
+		if n < minValidSeq {
+			continue
+		}
 		nums = append(nums, n)
 		numToName[n] = de.Name()
 	}
@@ -410,6 +454,66 @@ func discoverWALs(dir string) (paths []string, nextWALSeq int, err error) {
 		nextWALSeq = nums[len(nums)-1] + 1
 	}
 	return paths, nextWALSeq, nil
+}
+
+// readRestoreMarker returns the minimum valid sequence number recorded
+// in dir's restore marker file, or 0 if no marker exists (the common
+// case: no RestoreSnapshot call has ever happened here) — 0 means "no
+// filtering," since real sequence numbers start at 0 themselves and
+// nothing should ever need excluding by default.
+func readRestoreMarker(dir string) (int, error) {
+	data, err := os.ReadFile(filepath.Join(dir, restoreMarkerFileName))
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("engine: reading restore marker: %w", err)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0, fmt.Errorf("engine: malformed restore marker: %w", err)
+	}
+	return n, nil
+}
+
+// writeRestoreMarkerAtomically durably records minValidSeq as dir's new
+// restore marker: write-to-temp, fsync, then atomically rename over any
+// existing marker. If this crashes before the rename completes, the
+// OLD marker (or its absence) is untouched — recovery just proceeds as
+// if this particular RestoreSnapshot attempt never happened, a safe,
+// conservative failure mode rather than a corruption risk, matching the
+// same pattern raft's own SaveSnapshot compaction already uses.
+func writeRestoreMarkerAtomically(dir string, minValidSeq int) error {
+	finalPath := filepath.Join(dir, restoreMarkerFileName)
+	tmpPath := finalPath + ".tmp"
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("engine: creating restore marker temp file: %w", err)
+	}
+	// Accepted gap for the next three checks: WriteString/Sync/Close
+	// failing on a file this same call just successfully created isn't
+	// portably triggerable against a real filesystem — the same class
+	// of OS-level branch this project has consistently left untested
+	// elsewhere (e.g. raft's own SaveSnapshot compaction, or sstable's
+	// Stat/ReadAt failures on an already-opened fd).
+	if _, err := f.WriteString(strconv.Itoa(minValidSeq)); err != nil {
+		f.Close()
+		removeFile(tmpPath)
+		return fmt.Errorf("engine: writing restore marker temp file: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		removeFile(tmpPath)
+		return fmt.Errorf("engine: syncing restore marker temp file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		removeFile(tmpPath)
+		return fmt.Errorf("engine: closing restore marker temp file: %w", err)
+	}
+	if err := renameFile(tmpPath, finalPath); err != nil {
+		return fmt.Errorf("engine: replacing restore marker: %w", err)
+	}
+	return nil
 }
 
 func closeAll(entries []*sstableEntry) {
@@ -729,6 +833,11 @@ func writeSSTableFromMemtable(mem *memtable.Memtable, path string, opts Options)
 // already control, making that branch otherwise untestable.
 var removeFile = os.Remove
 
+// renameFile is a package-level indirection over os.Rename, for the
+// same reason as removeFile — used by RestoreSnapshot and the restore
+// marker's own atomic write.
+var renameFile = os.Rename
+
 func (e *Engine) sstablePath(n int) string {
 	return filepath.Join(e.opts.Dir, fmt.Sprintf(sstableFileNamePattern, n))
 }
@@ -745,6 +854,229 @@ type Stats struct {
 }
 
 // Stats returns a snapshot of the engine's current state.
+// Snapshot returns a byte-serialized snapshot of every currently-live
+// key-value pair (deleted/tombstoned keys are correctly excluded, since
+// a snapshot only needs to reflect current state, not history) as of
+// right now. Format: a stream of [4B key length][key][4B value
+// length][value] records, one per live key, until EOF.
+//
+// Deliberately built by gathering every distinct key this engine
+// currently knows about (across the active memtable, any in-progress
+// frozen memtable, and every SSTable) and then calling Get for each one
+// — rather than a full k-way merge across all those sources, which
+// would avoid materializing every key up front — reusing Get's own
+// already-correct, already-tested "newest source wins, respecting
+// tombstones" logic directly is a reasonable tradeoff for a dataset
+// this project's scope actually needs to handle, at the cost of being
+// less time- and space-efficient than a proper merge would be for a
+// much larger one; a clear target to revisit if that ever mattered.
+func (e *Engine) Snapshot() ([]byte, error) {
+	e.mu.RLock()
+	if e.closed {
+		e.mu.RUnlock()
+		return nil, fmt.Errorf("engine: snapshot of a closed engine")
+	}
+	keys := make(map[string]struct{})
+	collectKeys := func(it *memtable.Iterator) {
+		for it.SeekToFirst(); it.Valid(); it.Next() {
+			keys[string(it.Key())] = struct{}{}
+		}
+	}
+	collectKeys(e.mem.NewIterator())
+	if e.immutable != nil {
+		collectKeys(e.immutable.NewIterator())
+	}
+	for _, ss := range e.sstables {
+		reader, ok := ss.reader.(*sstable.Reader)
+		if !ok {
+			e.mu.RUnlock()
+			return nil, fmt.Errorf("engine: snapshot requires a real sstable reader, got %T", ss.reader)
+		}
+		it := reader.NewIterator()
+		for it.SeekToFirst(); it.Valid(); it.Next() {
+			keys[string(it.Key())] = struct{}{}
+		}
+	}
+	e.mu.RUnlock()
+
+	// Deliberately released the lock before this loop: each Get call
+	// below takes its own RLock independently (safe — this project's
+	// engine only ever has ONE writer, server.Server's single Run()
+	// goroutine, which is also the only goroutine that would ever call
+	// Snapshot itself, so there's no concurrent writer to race against
+	// here, only possibly-concurrent OTHER readers, which RLock already
+	// allows fine). Holding the lock across this whole loop instead
+	// would risk Go's own documented recursive-RLock footgun: a writer
+	// queued between an outer and inner RLock can deadlock both.
+	var buf bytes.Buffer
+	for k := range keys {
+		// Accepted gap: err != nil here essentially only happens if the
+		// engine gets closed in the narrow window between releasing
+		// the lock above and this call — the type assertion above
+		// already rules out an injectable fake sstable reader as a way
+		// to reach this branch (it fails earlier, during key
+		// gathering, before any of this runs), and reproducing the
+		// close-mid-scan race deterministically would need a dedicated
+		// test-only hook rather than a real filesystem trick — the
+		// same class of hard-to-trigger branch this project has left
+		// untested elsewhere.
+		val, found, err := e.Get([]byte(k))
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			continue
+		}
+		writeLenPrefixed(&buf, []byte(k))
+		writeLenPrefixed(&buf, val)
+	}
+	return buf.Bytes(), nil
+}
+
+// RestoreSnapshot replaces this engine's ENTIRE state with what's
+// encoded in data (as produced by Snapshot) — used when a follower has
+// fallen too far behind to catch up via normal replication and its
+// leader sent a full snapshot instead. Every existing SSTable and the
+// current WAL/memtable are discarded in favor of it.
+//
+// This is atomic with respect to a crash at any point during the call:
+// a fresh SSTable and a fresh WAL are built up entirely durably BEFORE
+// anything about the OLD state is touched, and the actual commit point
+// is a single small marker file written via the same write-temp-then-
+// atomic-rename pattern already used elsewhere in this project (see
+// writeRestoreMarkerAtomically's own doc) — a crash before that rename
+// completes leaves this engine's on-disk state exactly as it was before
+// this call started; a crash after leaves it exactly as this call
+// intended. Cleaning up the now-superseded old files happens last and
+// is deliberately best-effort: a crash there (or this process simply
+// never getting around to it) only wastes disk space, since discovery
+// on any future Open() already treats anything the marker supersedes as
+// gone regardless of whether it's been physically removed yet.
+func (e *Engine) RestoreSnapshot(data []byte) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.closed {
+		return fmt.Errorf("engine: restore snapshot on a closed engine")
+	}
+	if e.immutable != nil {
+		return fmt.Errorf("engine: cannot restore a snapshot while a background flush is already in progress")
+	}
+
+	entries, err := decodeSnapshotEntries(data)
+	if err != nil {
+		return fmt.Errorf("engine: decoding snapshot data: %w", err)
+	}
+	// The sstable writer requires keys added in sorted order; Snapshot's
+	// own serialization doesn't guarantee any particular order (it
+	// iterates a Go map internally), so that ordering has to happen
+	// somewhere — here, right before it actually matters, rather than
+	// baking a sort into Snapshot's format itself.
+	sort.Slice(entries, func(i, j int) bool { return bytes.Compare(entries[i].key, entries[j].key) < 0 })
+
+	newSeq := e.nextFlushSeq
+	if e.nextWALSeq > newSeq {
+		newSeq = e.nextWALSeq
+	}
+
+	sstablePath := filepath.Join(e.opts.Dir, fmt.Sprintf(sstableFileNamePattern, newSeq))
+	sw, err := newSSTableWriter(sstablePath, sstable.Options{
+		BlockSize:   e.opts.SSTableBlockSize,
+		BloomFPRate: e.opts.SSTableBloomFPRate,
+	})
+	if err != nil {
+		return fmt.Errorf("engine: creating snapshot sstable writer: %w", err)
+	}
+	for i, kv := range entries {
+		if err := sw.Add(kv.key, kv.value, uint64(i+1), false); err != nil {
+			return fmt.Errorf("engine: writing snapshot entry: %w", err)
+		}
+	}
+	if _, err := sw.Finish(); err != nil {
+		return fmt.Errorf("engine: finishing snapshot sstable: %w", err)
+	}
+	reader, err := openSSTableForRead(sstablePath, e.cache)
+	if err != nil {
+		return fmt.Errorf("engine: reopening snapshot sstable: %w", err)
+	}
+
+	newWALPath := filepath.Join(e.opts.Dir, fmt.Sprintf(walFileNamePattern, newSeq))
+	newWAL, err := openWAL(newWALPath, wal.Options{SyncOnWrite: true})
+	if err != nil {
+		reader.Close()
+		return fmt.Errorf("engine: opening fresh wal after snapshot restore: %w", err)
+	}
+
+	// The atomic commit point.
+	if err := writeRestoreMarkerAtomically(e.opts.Dir, newSeq); err != nil {
+		newWAL.Close()
+		reader.Close()
+		return fmt.Errorf("engine: committing snapshot restore: %w", err)
+	}
+
+	oldSSTables := e.sstables
+	oldWALPath := e.w.Path()
+
+	e.sstables = []*sstableEntry{{path: sstablePath, reader: reader}}
+	e.w = newWAL
+	e.mem = memtable.New()
+	e.nextFlushSeq = newSeq + 1
+	e.nextWALSeq = newSeq + 1
+	e.flushErr = nil
+
+	closeAll(oldSSTables)
+	for _, old := range oldSSTables {
+		removeFile(old.path)
+	}
+	removeFile(oldWALPath)
+
+	return nil
+}
+
+func writeLenPrefixed(buf *bytes.Buffer, b []byte) {
+	var lenBuf [4]byte
+	binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(b)))
+	buf.Write(lenBuf[:])
+	buf.Write(b)
+}
+
+type snapshotEntry struct {
+	key   []byte
+	value []byte
+}
+
+func decodeSnapshotEntries(data []byte) ([]snapshotEntry, error) {
+	var entries []snapshotEntry
+	off := 0
+	for off < len(data) {
+		key, next, err := readLenPrefixed(data, off)
+		if err != nil {
+			return nil, err
+		}
+		off = next
+		value, next, err := readLenPrefixed(data, off)
+		if err != nil {
+			return nil, err
+		}
+		off = next
+		entries = append(entries, snapshotEntry{key: key, value: value})
+	}
+	return entries, nil
+}
+
+func readLenPrefixed(data []byte, off int) ([]byte, int, error) {
+	if len(data)-off < 4 {
+		return nil, 0, fmt.Errorf("engine: malformed snapshot data: truncated length prefix")
+	}
+	n := binary.LittleEndian.Uint32(data[off:])
+	off += 4
+	if uint32(len(data)-off) < n {
+		return nil, 0, fmt.Errorf("engine: malformed snapshot data: declared length %d exceeds available %d", n, len(data)-off)
+	}
+	val := append([]byte(nil), data[off:off+int(n)]...)
+	return val, off + int(n), nil
+}
+
 func (e *Engine) Stats() Stats {
 	e.mu.RLock()
 	defer e.mu.RUnlock()

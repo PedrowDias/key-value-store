@@ -68,7 +68,7 @@ func newTestCluster(t *testing.T, n int) []*testNode {
 		}
 
 		dir := t.TempDir()
-		rn, err := raft.OpenNode(raft.Config{
+		rn, _, err := raft.OpenNode(raft.Config{
 			ID: id, Peers: peers,
 			ElectionTick: testElectionTicks, HeartbeatTick: testHeartbeatTick,
 		}, filepath.Join(dir, "raft.wal"))

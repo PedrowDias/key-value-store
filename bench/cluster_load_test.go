@@ -75,7 +75,7 @@ func startLoadTestClusterWithBatchWindow(t *testing.T, n int, raftBasePort, http
 		}
 
 		dir := t.TempDir()
-		rn, err := raft.OpenNode(raft.Config{
+		rn, _, err := raft.OpenNode(raft.Config{
 			ID: id, Peers: peers,
 			ElectionTick: loadTestElectionTicks, HeartbeatTick: loadTestHeartbeatTick,
 		}, filepath.Join(dir, "raft.wal"))
