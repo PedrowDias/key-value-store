@@ -22,7 +22,7 @@ func newTestAPIServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	dir := t.TempDir()
 
-	rn, err := raft.OpenNode(raft.Config{ID: 1, ElectionTick: 10, HeartbeatTick: 1}, filepath.Join(dir, "raft.wal"))
+	rn, _, err := raft.OpenNode(raft.Config{ID: 1, ElectionTick: 10, HeartbeatTick: 1}, filepath.Join(dir, "raft.wal"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +207,7 @@ func TestPut_OnFollowerReturnsServiceUnavailableWithLeaderHint(t *testing.T) {
 	// a 2-node cluster), so it stays a Follower forever — a reliable,
 	// deterministic way to exercise the not-leader path without timing
 	// games around a real election.
-	rn, err := raft.OpenNode(raft.Config{
+	rn, _, err := raft.OpenNode(raft.Config{
 		ID: 2, Peers: []uint64{1},
 		ElectionTick: 10, HeartbeatTick: 1,
 	}, filepath.Join(dir, "raft.wal"))
