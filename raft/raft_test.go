@@ -374,6 +374,216 @@ func TestVote_RequestAtLowerTermIsRejected(t *testing.T) {
 	}
 }
 
+// --- Pre-Vote: the core anti-disruption property ----------------------------
+
+// TestPreVote_IsolatedNodeNeverInflatesItsTermWhileCutOff is the direct,
+// deterministic version of the core claim
+// TestPartition_HealedMinorityRejoinsWithoutSplitBrain confirms at the
+// cluster-integration level: repeated election-timeout firings on a node
+// that can't reach anyone must never increment currentTerm, since that's
+// specifically what would otherwise let it disrupt a healthy leader the
+// moment it reconnects (see becomePreCandidate's doc).
+func TestPreVote_IsolatedNodeNeverInflatesItsTermWhileCutOff(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2, 3}, ElectionTick: 10, HeartbeatTick: 1})
+	startTerm := r.currentTerm
+
+	// Fire the election timeout repeatedly with no responses ever
+	// arriving (simulating total isolation) — each one should produce a
+	// PreVote round, never a real, term-incrementing candidacy.
+	for i := 0; i < 5; i++ {
+		for j := 0; j < 20; j++ { // comfortably past any randomized timeout
+			r.Tick()
+		}
+		readyMessages(r) // drain and discard; nothing ever responds
+	}
+
+	if r.currentTerm != startTerm {
+		t.Fatalf("currentTerm = %d after repeated isolated timeouts, want unchanged %d", r.currentTerm, startTerm)
+	}
+	if r.role != PreCandidate {
+		t.Fatalf("role = %v, want PreCandidate (never able to gather enough pre-votes to proceed)", r.role)
+	}
+}
+
+func TestPreVote_TimeoutSendsPreVoteNotRequestVote(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2, 3}, ElectionTick: 10, HeartbeatTick: 1})
+	for i := 0; i < 20; i++ {
+		r.Tick()
+	}
+	msgs := readyMessages(r)
+	if len(msgs) != 2 {
+		t.Fatalf("got %d messages, want 2 (one PreVote per peer)", len(msgs))
+	}
+	for _, m := range msgs {
+		if m.Type != MsgPreVote {
+			t.Fatalf("message type = %v, want MsgPreVote", m.Type)
+		}
+	}
+	if r.role != PreCandidate {
+		t.Fatalf("role = %v, want PreCandidate", r.role)
+	}
+	if r.currentTerm != 0 {
+		t.Fatalf("currentTerm = %d, want unchanged at 0 (a pre-vote round must not increment it)", r.currentTerm)
+	}
+}
+
+func TestPreVote_MajorityGrantsProceedsToRealCandidacy(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2, 3}, ElectionTick: 10, HeartbeatTick: 1})
+	startTerm := r.currentTerm
+	for i := 0; i < 20; i++ {
+		r.Tick()
+	}
+	readyMessages(r)
+
+	r.Step(Message{Type: MsgPreVoteResponse, To: 1, From: 2, VoteGranted: true})
+	if r.role != Candidate {
+		t.Fatalf("role = %v after a majority of pre-vote grants, want Candidate", r.role)
+	}
+	if r.currentTerm != startTerm+1 {
+		t.Fatalf("currentTerm = %d, want %d (incremented for the real election)", r.currentTerm, startTerm+1)
+	}
+	msgs := readyMessages(r)
+	var sawRealVoteRequest bool
+	for _, m := range msgs {
+		if m.Type == MsgRequestVote {
+			sawRealVoteRequest = true
+		}
+	}
+	if !sawRealVoteRequest {
+		t.Fatalf("expected real RequestVote messages after the pre-vote round succeeded, got %+v", msgs)
+	}
+}
+
+func TestPreVote_DeniedResponseNotCounted(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2, 3}, ElectionTick: 10, HeartbeatTick: 1})
+	for i := 0; i < 20; i++ {
+		r.Tick()
+	}
+	readyMessages(r)
+
+	r.Step(Message{Type: MsgPreVoteResponse, To: 1, From: 2, VoteGranted: false})
+	if r.role != PreCandidate {
+		t.Fatalf("role = %v after a DENIED pre-vote, want still PreCandidate", r.role)
+	}
+	if len(r.preVotesReceived) != 1 { // just our own
+		t.Fatalf("preVotesReceived = %v, want only self", r.preVotesReceived)
+	}
+}
+
+func TestPreVote_ResponseIgnoredIfNotPreCandidate(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2, 3}, ElectionTick: 10, HeartbeatTick: 1})
+	// Never entered a pre-vote round at all (still a fresh Follower).
+	r.Step(Message{Type: MsgPreVoteResponse, To: 1, From: 2, VoteGranted: true})
+	if r.role != Follower {
+		t.Fatalf("role = %v, want unchanged Follower for a stale/irrelevant pre-vote response", r.role)
+	}
+}
+
+func TestPreVote_AppendEntriesDuringPreVoteRoundStepsDownToFollower(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2, 3}, ElectionTick: 10, HeartbeatTick: 1})
+	for i := 0; i < 20; i++ {
+		r.Tick()
+	}
+	readyMessages(r)
+	if r.role != PreCandidate {
+		t.Fatalf("precondition failed: role = %v, want PreCandidate", r.role)
+	}
+
+	// A legitimate leader turns out to exist after all.
+	r.Step(Message{Type: MsgAppendEntries, To: 1, From: 2, Term: r.currentTerm + 1, PrevLogIndex: 0, PrevLogTerm: 0})
+	if r.role != Follower {
+		t.Fatalf("role = %v after a valid AppendEntries mid-pre-vote, want Follower", r.role)
+	}
+	if r.leaderID != 2 {
+		t.Fatalf("leaderID = %d, want 2", r.leaderID)
+	}
+}
+
+// --- Pre-Vote: grant/deny logic on the recipient side -----------------------
+
+func TestPreVote_GrantedIfLogUpToDateAndHaventVotedThisTerm(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2}, ElectionTick: 10, HeartbeatTick: 1})
+	// m.Term (the sender's actual current term, per send()'s auto-fill
+	// convention) is 0, so the prospective term this pre-vote is really
+	// asking about is 1.
+	r.Step(Message{Type: MsgPreVote, To: 1, From: 2, Term: 0, LastLogIndex: 0, LastLogTerm: 0})
+	msgs := readyMessages(r)
+	if len(msgs) != 1 || msgs[0].Type != MsgPreVoteResponse || !msgs[0].VoteGranted {
+		t.Fatalf("expected a granted PreVoteResponse, got %+v", msgs)
+	}
+	// Critically, granting a pre-vote must NOT mutate any real state.
+	if r.votedFor != 0 {
+		t.Fatalf("votedFor = %d after a pre-vote grant, want unchanged 0 — pre-vote must never record a real vote", r.votedFor)
+	}
+	if r.currentTerm != 0 {
+		t.Fatalf("currentTerm = %d after a pre-vote grant, want unchanged 0", r.currentTerm)
+	}
+}
+
+func TestPreVote_DeniedIfProspectiveTermBehindOurCurrentTerm(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2}, ElectionTick: 10, HeartbeatTick: 1})
+	r.currentTerm = 10
+	// Sender's actual term is 5, so it's asking about prospective term 6
+	// — behind our current term of 10; even a real election there
+	// couldn't beat where we already are.
+	r.Step(Message{Type: MsgPreVote, To: 1, From: 2, Term: 5, LastLogIndex: 0, LastLogTerm: 0})
+	msgs := readyMessages(r)
+	if len(msgs) != 1 || msgs[0].VoteGranted {
+		t.Fatalf("expected a denied PreVoteResponse for a prospective term behind ours, got %+v", msgs)
+	}
+}
+
+func TestPreVote_DeniedIfCandidateLogIsLessUpToDate(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2}, ElectionTick: 10, HeartbeatTick: 1})
+	r.log = append(r.log, LogEntry{Term: 5, Index: 1})
+
+	r.Step(Message{Type: MsgPreVote, To: 1, From: 2, Term: 5, LastLogIndex: 0, LastLogTerm: 0})
+	msgs := readyMessages(r)
+	if len(msgs) != 1 || msgs[0].VoteGranted {
+		t.Fatalf("expected a denied PreVoteResponse for a less-up-to-date candidate log, got %+v", msgs)
+	}
+}
+
+func TestPreVote_GrantedDespiteAlreadyVotedIfProspectiveTermIsHigher(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2, 3}, ElectionTick: 10, HeartbeatTick: 1})
+	// Already voted for node 3 this term — a REAL vote request from
+	// node 2 at the SAME term would be denied (see TestVote_WontVoteTwiceInSameTerm).
+	r.currentTerm = 1
+	r.votedFor = 3
+
+	// But a pre-vote asking about a STRICTLY HIGHER prospective term
+	// (sender's actual term 1, prospective term 2) can honestly be
+	// granted: a real request at term 2 would first advance us there
+	// and clear our stale vote for 3, so we'd genuinely be free to vote
+	// for node 2 at that point.
+	r.Step(Message{Type: MsgPreVote, To: 1, From: 2, Term: 1, LastLogIndex: 0, LastLogTerm: 0})
+	msgs := readyMessages(r)
+	if len(msgs) != 1 || !msgs[0].VoteGranted {
+		t.Fatalf("expected a granted PreVoteResponse despite an existing same-term vote, since the prospective term is strictly higher, got %+v", msgs)
+	}
+	// Still must not have mutated our actual vote record.
+	if r.votedFor != 3 {
+		t.Fatalf("votedFor = %d after a pre-vote grant, want unchanged 3", r.votedFor)
+	}
+}
+
+func TestPreVote_DeniedIfAlreadyVotedAndProspectiveTermNotHigher(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2, 3}, ElectionTick: 10, HeartbeatTick: 1})
+	r.currentTerm = 2
+	r.votedFor = 3
+
+	// Sender's actual term is 1, so prospective term is 2 — equal to,
+	// not higher than, our current term. We've already committed our
+	// real vote to node 3 this exact term, so a real request at term 2
+	// from node 2 would genuinely be denied — the pre-vote must say so
+	// truthfully too.
+	r.Step(Message{Type: MsgPreVote, To: 1, From: 2, Term: 1, LastLogIndex: 0, LastLogTerm: 0})
+	msgs := readyMessages(r)
+	if len(msgs) != 1 || msgs[0].VoteGranted {
+		t.Fatalf("expected a denied PreVoteResponse (already voted this term, prospective term not higher), got %+v", msgs)
+	}
+}
+
 func TestRequestVoteResponse_HigherTermCausesStepDown(t *testing.T) {
 	r, _ := New(Config{ID: 1, Peers: []uint64{2, 3}, ElectionTick: 10, HeartbeatTick: 1})
 	r.becomeCandidate()
@@ -390,7 +600,7 @@ func TestRequestVoteResponse_HigherTermCausesStepDown(t *testing.T) {
 }
 
 func TestRole_String(t *testing.T) {
-	cases := map[Role]string{Follower: "Follower", Candidate: "Candidate", Leader: "Leader", Role(99): "Unknown"}
+	cases := map[Role]string{Follower: "Follower", PreCandidate: "PreCandidate", Candidate: "Candidate", Leader: "Leader", Role(99): "Unknown"}
 	for role, want := range cases {
 		if got := role.String(); got != want {
 			t.Errorf("Role(%d).String() = %q, want %q", role, got, want)
@@ -400,6 +610,8 @@ func TestRole_String(t *testing.T) {
 
 func TestMessageType_String(t *testing.T) {
 	cases := map[MessageType]string{
+		MsgPreVote:               "PreVote",
+		MsgPreVoteResponse:       "PreVoteResponse",
 		MsgRequestVote:           "RequestVote",
 		MsgRequestVoteResponse:   "RequestVoteResponse",
 		MsgAppendEntries:         "AppendEntries",
@@ -722,6 +934,46 @@ func TestAppendEntriesResponse_StaleTermIgnored(t *testing.T) {
 	}
 }
 
+func TestAppendEntriesResponse_HigherTermCausesStepDown(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2, 3}, ElectionTick: 10, HeartbeatTick: 1})
+	r.becomeCandidate()
+	r.becomeLeader()
+	term := r.Status().Term
+
+	r.Step(Message{Type: MsgAppendEntriesResponse, From: 2, To: 1, Term: term + 5, Success: false})
+	s := r.Status()
+	if s.Role != Follower {
+		t.Fatalf("role = %v, want Follower after seeing a higher term in an AppendEntriesResponse", s.Role)
+	}
+	if s.Term != term+5 {
+		t.Fatalf("term = %d, want %d", s.Term, term+5)
+	}
+}
+
+func TestAppendEntriesResponse_FailureBacksOffNextIndexAndRetries(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2}, ElectionTick: 10, HeartbeatTick: 1})
+	r.becomeCandidate()
+	r.becomeLeader()
+	r.Ready() // drain the become-leader heartbeat
+	r.Advance()
+	r.nextIndex[2] = 5 // simulate having advanced past index 1, needing to back off on conflict
+
+	r.Step(Message{Type: MsgAppendEntriesResponse, From: 2, To: 1, Term: r.currentTerm, Success: false})
+	if got := r.nextIndex[2]; got != 4 {
+		t.Fatalf("nextIndex[2] = %d after a conflict response, want 4 (backed off by one)", got)
+	}
+	msgs := r.Ready().Messages
+	var retried bool
+	for _, m := range msgs {
+		if m.Type == MsgAppendEntries && m.To == 2 && m.PrevLogIndex == 3 {
+			retried = true
+		}
+	}
+	if !retried {
+		t.Fatalf("expected an immediate retry AppendEntries with PrevLogIndex=3, got %+v", msgs)
+	}
+}
+
 func TestAppendEntries_LowerTermRejected(t *testing.T) {
 	r, _ := New(Config{ID: 1, Peers: []uint64{2}, ElectionTick: 10, HeartbeatTick: 1})
 	r.currentTerm = 5
@@ -942,23 +1194,33 @@ func TestPartition_HealedMinorityRejoinsWithoutSplitBrain(t *testing.T) {
 	c.propose([]byte("committed-during-partition"))
 	c.ticks(3)
 
+	leaderTermBeforeHeal := c.nodes[initialLeader].Status().Term
+
 	c.heal(4)
 	c.heal(5)
-	// A node that kept timing out while isolated has an inflated term
-	// and can force the current leader to step down on rejoining, even
-	// though it can't actually win an election (its log is behind) —
-	// this can take a few disruptive rounds to settle without a
-	// pre-vote extension (a known, documented vanilla-Raft
-	// characteristic, not a bug: the system stays safe throughout,
-	// just slower to restabilize). Give it generous room to converge.
-	c.ticks(200)
+	// Before the Pre-Vote extension, a node that kept timing out while
+	// isolated would have an inflated term and could force the current
+	// leader to step down on rejoining, even though it can't actually
+	// win an election (its log is behind) — a known, documented vanilla-
+	// Raft characteristic, not a bug, but a real, measurable disruption.
+	// With Pre-Vote (see becomePreCandidate's doc), an isolated node
+	// never gathers enough pre-vote grants to increment its term while
+	// cut off, so healing should cause NO disruption at all: the SAME
+	// leader stays leader, converging in the time for one ordinary
+	// heartbeat/replication round — not the "give it 200 ticks to
+	// eventually resettle" room a pre-vote-less implementation needs.
+	c.ticks(5)
 
-	// Exactly one leader across the whole (now-healed) cluster.
 	finalLeader, ok := c.leader()
 	if !ok {
 		t.Fatal("expected exactly one leader after healing")
 	}
-	_ = initialLeader // the leader may or may not have changed; what matters is there's exactly one now
+	if finalLeader != initialLeader {
+		t.Fatalf("leader changed from %d to %d on a healthy partition healing — Pre-Vote should have prevented any disruption", initialLeader, finalLeader)
+	}
+	if got := c.nodes[finalLeader].Status().Term; got != leaderTermBeforeHeal {
+		t.Fatalf("leader's term changed from %d to %d on healing — Pre-Vote should mean the previously-isolated nodes never inflated their term while cut off, so rejoining shouldn't force a new term either", leaderTermBeforeHeal, got)
+	}
 
 	if !c.allCommitted(1) {
 		t.Fatal("expected the entry committed during the partition to propagate to all nodes after healing")

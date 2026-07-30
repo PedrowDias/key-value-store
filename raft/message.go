@@ -30,6 +30,7 @@ type Role int
 
 const (
 	Follower Role = iota
+	PreCandidate
 	Candidate
 	Leader
 )
@@ -38,6 +39,8 @@ func (r Role) String() string {
 	switch r {
 	case Follower:
 		return "Follower"
+	case PreCandidate:
+		return "PreCandidate"
 	case Candidate:
 		return "Candidate"
 	case Leader:
@@ -57,14 +60,17 @@ type LogEntry struct {
 	Data  []byte
 }
 
-// MessageType distinguishes the four message shapes Raft's leader
-// election and log replication exchange. A single Message struct (rather
+// MessageType distinguishes the six message shapes Raft's leader
+// election (including the Pre-Vote extension — see becomePreCandidate's
+// doc) and log replication exchange. A single Message struct (rather
 // than four separate types) keeps Step()'s dispatch and the outbox
 // simple; fields irrelevant to a given Type are left zero.
 type MessageType int
 
 const (
-	MsgRequestVote MessageType = iota
+	MsgPreVote MessageType = iota
+	MsgPreVoteResponse
+	MsgRequestVote
 	MsgRequestVoteResponse
 	MsgAppendEntries
 	MsgAppendEntriesResponse
@@ -72,6 +78,10 @@ const (
 
 func (t MessageType) String() string {
 	switch t {
+	case MsgPreVote:
+		return "PreVote"
+	case MsgPreVoteResponse:
+		return "PreVoteResponse"
 	case MsgRequestVote:
 		return "RequestVote"
 	case MsgRequestVoteResponse:

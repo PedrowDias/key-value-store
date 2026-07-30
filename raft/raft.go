@@ -177,6 +177,10 @@ type Raft struct {
 	// Candidate-only volatile state. Reset fresh on every new election.
 	votesReceived map[uint64]bool
 
+	// PreCandidate-only volatile state. Reset fresh on every new
+	// pre-vote round. See becomePreCandidate's doc.
+	preVotesReceived map[uint64]bool
+
 	electionTick              int
 	heartbeatTick             int
 	electionElapsed           int
@@ -322,7 +326,7 @@ func (r *Raft) Tick() {
 	}
 	r.electionElapsed++
 	if r.electionElapsed >= r.randomizedElectionTimeout {
-		r.becomeCandidate()
+		r.becomePreCandidate()
 	}
 }
 
@@ -335,6 +339,10 @@ func (r *Raft) Step(m Message) {
 		return
 	}
 	switch m.Type {
+	case MsgPreVote:
+		r.handlePreVote(m)
+	case MsgPreVoteResponse:
+		r.handlePreVoteResponse(m)
 	case MsgRequestVote:
 		r.handleRequestVote(m)
 	case MsgRequestVoteResponse:
@@ -361,9 +369,65 @@ func (r *Raft) becomeFollower(term uint64) {
 	r.resetElectionTimeout()
 }
 
-// becomeCandidate starts a new election: increments the term, votes for
-// itself, and requests votes from every peer. A single-node cluster
-// (no peers) trivially already has a majority and becomes leader at once.
+// becomePreCandidate starts a Pre-Vote round: the standard extension
+// (from the Raft dissertation, §9.6) to the base algorithm that prevents
+// a node cut off from the cluster — but still very much alive and
+// ticking — from disrupting a healthy leader the moment its network
+// partition heals. Without this, a partitioned node's election timeout
+// fires repeatedly with nothing to interrupt it, each time incrementing
+// its term further via becomeCandidate; when the partition heals, that
+// inflated term causes every other node to see "a higher term than
+// mine" and step down — even the current, perfectly healthy leader —
+// triggering a real, disruptive election for no good reason.
+//
+// The fix: before incrementing the term for real, ask every peer "if I
+// asked for your vote at term+1 right now, would you grant it?" — using
+// the exact same log-up-to-date criteria a real RequestVote would, but
+// crucially causing NO state mutation on either side (see handlePreVote).
+// Only once a majority say yes does this proceed to becomeCandidate and
+// start a real, term-incrementing election. A node that's genuinely
+// partitioned from the majority never gets enough pre-vote grants, so
+// it never increments its term — its own election timeout keeps firing,
+// but every attempt is a no-op round of pre-votes, not a real election.
+// When the partition heals, it rejoins at the same term everyone else
+// is at, disrupting nothing.
+//
+// Because no state changes, a pre-vote round requires no HardState
+// persistence at all — Ready()'s change-detection correctly reports no
+// new HardState for it, unlike becomeCandidate's real term/vote change,
+// which the caller must persist before its RequestVote messages are
+// safe to send. Tick()'s timeout-driven path always goes through here
+// now, including retrying a PreCandidate or Candidate whose own timeout
+// fires again without success — every path that could start or restart
+// an election goes through a pre-vote check first.
+func (r *Raft) becomePreCandidate() {
+	r.role = PreCandidate
+	r.leaderID = 0
+	r.preVotesReceived = map[uint64]bool{r.id: true}
+	r.resetElectionTimeout()
+
+	if len(r.peers) == 0 {
+		// No one to ask, so a majority of one is already trivially
+		// satisfied — proceed straight to a real (but, for a
+		// single-node cluster, uncontested and instant) election.
+		r.becomeCandidate()
+		return
+	}
+	for _, p := range r.peers {
+		r.send(Message{
+			Type:         MsgPreVote,
+			To:           p,
+			LastLogIndex: r.lastLogIndex(),
+			LastLogTerm:  r.lastLogTerm(),
+		})
+	}
+}
+
+// becomeCandidate starts a real election: increments the term, votes for
+// itself, and requests votes from every peer. Only reached via a
+// successful Pre-Vote round (see becomePreCandidate) — or, for a
+// single-node cluster with no peers to ask, immediately and
+// unconditionally, since a majority of one needs no votes at all.
 func (r *Raft) becomeCandidate() {
 	r.currentTerm++
 	r.role = Candidate
@@ -436,6 +500,59 @@ func (r *Raft) sendAppendEntries(peer uint64) {
 	})
 	if r.lastLogIndex() > r.sentIndex[peer] {
 		r.sentIndex[peer] = r.lastLogIndex()
+	}
+}
+
+// handlePreVote answers "if you asked for a real vote right now, would
+// I grant it" — WITHOUT mutating currentTerm or votedFor, which is the
+// entire point (see becomePreCandidate's doc): a partitioned candidate's
+// escalating hypothetical term can't disrupt anyone just by asking about
+// it. send() always stamps an outgoing message's Term with this node's
+// own current (real) term, so a candidate mid-pre-vote — whose own term
+// hasn't incremented yet — necessarily sends m.Term equal to its actual
+// current term; the term it's really asking about is m.Term+1 (what it
+// would become upon starting a real election), computed here rather
+// than carried as a separate field.
+func (r *Raft) handlePreVote(m Message) {
+	prospectiveTerm := m.Term + 1
+	if prospectiveTerm < r.currentTerm {
+		// Even a real election at this term couldn't beat where we
+		// already are.
+		r.send(Message{Type: MsgPreVoteResponse, To: m.From, VoteGranted: false})
+		return
+	}
+
+	logOK := m.LastLogTerm > r.lastLogTerm() ||
+		(m.LastLogTerm == r.lastLogTerm() && m.LastLogIndex >= r.lastLogIndex())
+
+	// canVote mirrors handleRequestVote's own check, with one addition:
+	// even if we've already voted for someone else this term, we can
+	// truthfully say yes to a pre-vote at a STRICTLY higher prospective
+	// term, because a real request at that term would first advance us
+	// to it and clear our stale vote (see becomeFollower) — so answering
+	// honestly here isn't premature or inconsistent with what we'd
+	// actually do.
+	canVote := r.votedFor == 0 || r.votedFor == m.From || prospectiveTerm > r.currentTerm
+
+	r.send(Message{Type: MsgPreVoteResponse, To: m.From, VoteGranted: canVote && logOK})
+}
+
+// handlePreVoteResponse counts a pre-vote grant. No term-based state
+// transition happens here at all (unlike handleRequestVoteResponse) —
+// by design: a pre-vote round is purely a non-binding poll, so nothing
+// either side learns from it should mutate any durable state. Once a
+// majority have granted, this proceeds to becomeCandidate — the one
+// point where a pre-vote round's success actually does something.
+func (r *Raft) handlePreVoteResponse(m Message) {
+	if r.role != PreCandidate {
+		return // stale: a previous round, or we've since moved on
+	}
+	if !m.VoteGranted {
+		return
+	}
+	r.preVotesReceived[m.From] = true
+	if r.hasMajorityCount(len(r.preVotesReceived)) {
+		r.becomeCandidate()
 	}
 }
 

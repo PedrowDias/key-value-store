@@ -81,7 +81,7 @@ go test ./... -race -short
 | `memtable` | In-memory skip-list write buffer with snapshot-isolated iteration. |
 | `sstable` | Immutable on-disk sorted tables: block index + Bloom filter for point lookups. |
 | `engine` | Wires `wal` + `memtable` + `sstable` into `Put`/`Get`/`Delete`/`ApplyBatch`, with auto-flush and crash recovery. |
-| `raft` | Leader election, log replication, crash-safe persistence (`Ready`/`Advance`), batched proposals. |
+| `raft` | Leader election with the Pre-Vote extension, log replication, crash-safe persistence (`Ready`/`Advance`), batched proposals. |
 | `transport` | Custom binary wire protocol over TCP connecting cluster nodes. |
 | `server` | The replicated state machine: drives one `raft.Node`, applies committed entries to one `engine.Engine`, serves the HTTP API. |
 | `cmd/kvstore` | The runnable binary: flags, wiring, graceful shutdown. |
@@ -156,6 +156,30 @@ wrong (sending a vote before it's durable) is exactly the kind of bug
 that only shows up after a crash at the wrong moment — encoding the
 ordering into the API, rather than trusting every caller to remember it,
 is the point.
+
+**Pre-Vote: every election-timeout-driven path goes through a
+non-binding poll first, not just the first attempt.** Without it, a
+node cut off from the cluster — still alive, still ticking — has its
+election timeout fire repeatedly with nothing to interrupt it, each
+time incrementing its term further. When the partition heals, that
+inflated term forces every other node, including a perfectly healthy
+leader, to step down: safe, but a real, avoidable disruption. The fix
+(`becomePreCandidate`, from the Raft dissertation §9.6): ask every peer
+"would you grant me a vote at term+1 right now?" without incrementing
+the term at all; only proceed to a real, term-incrementing
+`becomeCandidate` once a majority say yes. A node that's genuinely cut
+off never gathers enough pre-vote grants, so its term never inflates —
+`Tick()` routes every timeout-driven transition through this now,
+including retrying a candidacy that's already timing out, not only the
+initial one. Verified by strengthening an existing test rather than
+just adding a new one:
+`TestPartition_HealedMinorityRejoinsWithoutSplitBrain` used to need 200
+ticks of "give it room to eventually resettle" after healing a
+partition (a comment explicitly noting this was a known, undesirable
+vanilla-Raft characteristic); with Pre-Vote, the same scenario now
+asserts the *same* leader survives with *zero* disruption, converging
+in 5 ticks — passing reliably across 30 repeated runs with different
+random seeds.
 
 **Group commit took four rounds to actually get right, and the last two
 found real bugs — one in the benchmark tool, one genuinely in `raft`
@@ -301,9 +325,6 @@ cluster.
 
 ## Known limitations / possible future work
 
-- **No pre-vote extension**: a partitioned node's inflated term can
-  briefly disrupt a healthy leader on rejoin (safe, but slower to
-  restabilize than necessary).
 - **No log compaction / snapshotting**: the Raft log grows unboundedly;
   a new or long-partitioned node replays the whole log rather than
   installing a snapshot.
