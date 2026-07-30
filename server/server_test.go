@@ -265,6 +265,92 @@ func TestServer_Put_OnFollowerReturnsError(t *testing.T) {
 	}
 }
 
+// --- Linearizable reads (ReadIndex) ------------------------------------------
+
+func TestServer_SingleNode_LinearizableGet(t *testing.T) {
+	nodes := newTestCluster(t, 1)
+	leader := waitForLeader(t, nodes, 2*time.Second)
+
+	if err := leader.server.Put([]byte("k"), []byte("v")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	val, found, err := leader.server.LinearizableGet([]byte("k"))
+	if err != nil || !found || string(val) != "v" {
+		t.Fatalf("LinearizableGet(k) = %q found=%v err=%v, want v true nil", val, found, err)
+	}
+}
+
+func TestServer_LinearizableGet_NotFoundKey(t *testing.T) {
+	nodes := newTestCluster(t, 1)
+	leader := waitForLeader(t, nodes, 2*time.Second)
+
+	_, found, err := leader.server.LinearizableGet([]byte("never-written"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found {
+		t.Fatal("expected not found for a key that was never written")
+	}
+}
+
+func TestServer_ThreeNodeCluster_LinearizableGetOnLeaderReflectsCommittedWrite(t *testing.T) {
+	nodes := newTestCluster(t, 3)
+	leader := waitForLeader(t, nodes, 2*time.Second)
+
+	if err := leader.server.Put([]byte("k"), []byte("v")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	// Unlike Get (which might need a wait-and-retry against a follower
+	// that hasn't caught up yet), LinearizableGet against the LEADER
+	// should see an already-committed write immediately, with no
+	// polling needed — that's the whole point of the guarantee.
+	val, found, err := leader.server.LinearizableGet([]byte("k"))
+	if err != nil || !found || string(val) != "v" {
+		t.Fatalf("LinearizableGet(k) on the leader = %q found=%v err=%v, want v true nil", val, found, err)
+	}
+}
+
+func TestServer_LinearizableGet_OnFollowerReturnsError(t *testing.T) {
+	nodes := newTestCluster(t, 3)
+	leader := waitForLeader(t, nodes, 2*time.Second)
+
+	var follower *testNode
+	for _, n := range nodes {
+		if n.id != leader.id {
+			follower = n
+			break
+		}
+	}
+
+	_, _, err := follower.server.LinearizableGet([]byte("k"))
+	if err == nil {
+		t.Fatal("expected an error calling LinearizableGet through a follower")
+	}
+}
+
+func TestServer_LinearizableGet_TimesOutWhenMajorityUnreachable(t *testing.T) {
+	orig := proposeTimeout
+	proposeTimeout = 300 * time.Millisecond
+	defer func() { proposeTimeout = orig }()
+
+	nodes := newTestCluster(t, 3)
+	leader := waitForLeader(t, nodes, 2*time.Second)
+
+	// Stop the two followers so the leader can never get a majority of
+	// acks confirming its continued leadership — the read can never be
+	// confirmed.
+	for _, n := range nodes {
+		if n.id != leader.id {
+			n.server.Stop()
+		}
+	}
+
+	_, _, err := leader.server.LinearizableGet([]byte("k"))
+	if err == nil {
+		t.Fatal("expected LinearizableGet to fail (timeout) when a majority is unreachable")
+	}
+}
+
 // --- Leader failover ---------------------------------------------------------
 
 func TestServer_LeaderFailover_ClusterContinuesServing(t *testing.T) {

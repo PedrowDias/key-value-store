@@ -584,6 +584,245 @@ func TestPreVote_DeniedIfAlreadyVotedAndProspectiveTermNotHigher(t *testing.T) {
 	}
 }
 
+// --- ReadIndex: the linearizable-read confirmation protocol -----------------
+
+func TestRequestReadIndex_NotLeaderReturnsError(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2, 3}, ElectionTick: 10, HeartbeatTick: 1})
+	if err := r.RequestReadIndex(1); err != ErrNotLeader {
+		t.Fatalf("RequestReadIndex on a non-leader = %v, want ErrNotLeader", err)
+	}
+}
+
+func TestRequestReadIndex_SingleNodeClusterConfirmsImmediately(t *testing.T) {
+	r, _ := New(Config{ID: 1, ElectionTick: 10, HeartbeatTick: 1})
+	r.becomeCandidate() // no peers: becomes leader immediately
+	if err := r.RequestReadIndex(42); err != nil {
+		t.Fatal(err)
+	}
+	rd := r.Ready()
+	if len(rd.ReadStates) != 1 || rd.ReadStates[0].Context != 42 {
+		t.Fatalf("ReadStates = %+v, want exactly one confirmed for context 42", rd.ReadStates)
+	}
+}
+
+func TestRequestReadIndex_SendsAppendEntriesWithReadContextToEveryPeer(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2, 3}, ElectionTick: 10, HeartbeatTick: 1})
+	r.becomeCandidate()
+	r.becomeLeader()
+	readyMessages(r) // drain the become-leader heartbeats
+
+	if err := r.RequestReadIndex(7); err != nil {
+		t.Fatal(err)
+	}
+	msgs := readyMessages(r)
+	if len(msgs) != 2 {
+		t.Fatalf("got %d messages, want 2 (one probe per peer)", len(msgs))
+	}
+	for _, m := range msgs {
+		if m.Type != MsgAppendEntries || m.ReadContext != 7 {
+			t.Fatalf("message = %+v, want an AppendEntries carrying ReadContext=7", m)
+		}
+	}
+}
+
+func TestRequestReadIndex_MajorityAcksConfirmsReadState(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2, 3, 4, 5}, ElectionTick: 10, HeartbeatTick: 1})
+	r.becomeCandidate()
+	r.becomeLeader()
+	readyMessages(r)
+
+	if err := r.RequestReadIndex(7); err != nil {
+		t.Fatal(err)
+	}
+	readyMessages(r)
+
+	// Self-ack (1 of 5) plus two peers = 3 of 5, a majority.
+	r.Step(Message{Type: MsgAppendEntriesResponse, To: 1, From: 2, Term: r.currentTerm, Success: true, ReadContext: 7})
+	if rd := r.Ready(); len(rd.ReadStates) != 0 {
+		t.Fatalf("ReadStates = %+v after only 2 of 5 acks, want none yet", rd.ReadStates)
+	}
+	r.Step(Message{Type: MsgAppendEntriesResponse, To: 1, From: 3, Term: r.currentTerm, Success: true, ReadContext: 7})
+
+	rd := r.Ready()
+	if len(rd.ReadStates) != 1 || rd.ReadStates[0].Context != 7 {
+		t.Fatalf("ReadStates = %+v after a majority of acks, want exactly one confirmed for context 7", rd.ReadStates)
+	}
+}
+
+func TestRequestReadIndex_ResponseWithoutReadContextDoesNotConfirmAnything(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2, 3}, ElectionTick: 10, HeartbeatTick: 1})
+	r.becomeCandidate()
+	r.becomeLeader()
+	readyMessages(r)
+
+	if err := r.RequestReadIndex(7); err != nil {
+		t.Fatal(err)
+	}
+	readyMessages(r)
+
+	// An ordinary response, unrelated to any read, must not accidentally
+	// count toward a pending read's majority.
+	r.Step(Message{Type: MsgAppendEntriesResponse, To: 1, From: 2, Term: r.currentTerm, Success: true})
+	if rd := r.Ready(); len(rd.ReadStates) != 0 {
+		t.Fatalf("ReadStates = %+v after a response with no ReadContext, want none", rd.ReadStates)
+	}
+}
+
+func TestRequestReadIndex_StaleOrUnknownContextIgnored(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2, 3}, ElectionTick: 10, HeartbeatTick: 1})
+	r.becomeCandidate()
+	r.becomeLeader()
+	readyMessages(r)
+
+	// No RequestReadIndex(999) was ever made; an ack referencing it must
+	// be a harmless no-op, not a panic (e.g. from a nil map lookup).
+	r.Step(Message{Type: MsgAppendEntriesResponse, To: 1, From: 2, Term: r.currentTerm, Success: true, ReadContext: 999})
+	if rd := r.Ready(); len(rd.ReadStates) != 0 {
+		t.Fatalf("ReadStates = %+v for an unknown context, want none", rd.ReadStates)
+	}
+}
+
+func TestRequestReadIndex_MultipleConcurrentRequestsTrackedIndependently(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2, 3}, ElectionTick: 10, HeartbeatTick: 1})
+	r.becomeCandidate()
+	r.becomeLeader()
+	readyMessages(r)
+
+	if err := r.RequestReadIndex(100); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.RequestReadIndex(200); err != nil {
+		t.Fatal(err)
+	}
+	readyMessages(r)
+
+	// Confirm only context 100 (2 of 3, a majority).
+	r.Step(Message{Type: MsgAppendEntriesResponse, To: 1, From: 2, Term: r.currentTerm, Success: true, ReadContext: 100})
+	rd := r.Ready()
+	if len(rd.ReadStates) != 1 || rd.ReadStates[0].Context != 100 {
+		t.Fatalf("ReadStates = %+v, want exactly context 100 confirmed, not 200", rd.ReadStates)
+	}
+	r.Advance()
+
+	// Now confirm 200 too.
+	r.Step(Message{Type: MsgAppendEntriesResponse, To: 1, From: 3, Term: r.currentTerm, Success: true, ReadContext: 200})
+	rd = r.Ready()
+	if len(rd.ReadStates) != 1 || rd.ReadStates[0].Context != 200 {
+		t.Fatalf("ReadStates = %+v, want exactly context 200 confirmed", rd.ReadStates)
+	}
+}
+
+func TestRequestReadIndex_IndexReflectsCommitIndexAtRequestTimeNotLater(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2, 3}, ElectionTick: 10, HeartbeatTick: 1})
+	r.becomeCandidate()
+	r.becomeLeader()
+	readyMessages(r) // drain the become-leader heartbeats
+
+	// Commit one entry before requesting the read: propose it, then
+	// manually ack it from both peers so it actually commits.
+	if _, err := r.ProposeBatch([][]byte{[]byte("committed-before-the-read")}); err != nil {
+		t.Fatal(err)
+	}
+	readyMessages(r)
+	r.Step(Message{Type: MsgAppendEntriesResponse, To: 1, From: 2, Term: r.currentTerm, Success: true, MatchIndex: 1})
+	r.Step(Message{Type: MsgAppendEntriesResponse, To: 1, From: 3, Term: r.currentTerm, Success: true, MatchIndex: 1})
+	indexAtReadTime := r.commitIndex
+	if indexAtReadTime != 1 {
+		t.Fatalf("precondition failed: commitIndex = %d, want 1", indexAtReadTime)
+	}
+
+	if err := r.RequestReadIndex(55); err != nil {
+		t.Fatal(err)
+	}
+	probes := readyMessages(r)
+	if len(probes) != 2 {
+		t.Fatalf("got %d read-index probe messages, want 2", len(probes))
+	}
+
+	// Commit a SECOND entry — advancing commitIndex further — before
+	// delivering the read-index probe responses below. The eventually
+	// confirmed ReadState must still reflect indexAtReadTime (1), not
+	// this newer, higher commitIndex.
+	if _, err := r.ProposeBatch([][]byte{[]byte("committed-after-the-read-was-requested")}); err != nil {
+		t.Fatal(err)
+	}
+	readyMessages(r)
+	r.Step(Message{Type: MsgAppendEntriesResponse, To: 1, From: 2, Term: r.currentTerm, Success: true, MatchIndex: 2})
+	r.Step(Message{Type: MsgAppendEntriesResponse, To: 1, From: 3, Term: r.currentTerm, Success: true, MatchIndex: 2})
+	if r.commitIndex != 2 {
+		t.Fatalf("commitIndex after the second commit = %d, want 2 (otherwise this test isn't exercising the scenario)", r.commitIndex)
+	}
+
+	// NOW deliver the (still-outstanding) read-index probe responses —
+	// echoing ReadContext=55, matching what a real follower's
+	// AppendEntriesResponse to those earlier probes would carry.
+	r.Step(Message{Type: MsgAppendEntriesResponse, To: 1, From: 2, Term: r.currentTerm, Success: true, MatchIndex: 2, ReadContext: 55})
+	rd := r.Ready()
+	var found *ReadState
+	for i := range rd.ReadStates {
+		if rd.ReadStates[i].Context == 55 {
+			found = &rd.ReadStates[i]
+		}
+	}
+	if found == nil {
+		// Only 1 of 2 peers acked so far — not yet a majority (2 of 3
+		// including self); confirm it's still correctly pending.
+		r.Step(Message{Type: MsgAppendEntriesResponse, To: 1, From: 3, Term: r.currentTerm, Success: true, MatchIndex: 2, ReadContext: 55})
+		rd = r.Ready()
+		for i := range rd.ReadStates {
+			if rd.ReadStates[i].Context == 55 {
+				found = &rd.ReadStates[i]
+			}
+		}
+	}
+	if found == nil {
+		t.Fatalf("expected a confirmed ReadState for context 55, got %+v", rd.ReadStates)
+	}
+	if found.Index != indexAtReadTime {
+		t.Fatalf("ReadState.Index = %d, want %d (commitIndex as of the request, not the later, higher one)", found.Index, indexAtReadTime)
+	}
+}
+
+func TestRequestReadIndex_PendingReadsResetOnNewLeadership(t *testing.T) {
+	r, _ := New(Config{ID: 1, Peers: []uint64{2, 3}, ElectionTick: 10, HeartbeatTick: 1})
+	r.becomeCandidate()
+	r.becomeLeader()
+	readyMessages(r)
+	if err := r.RequestReadIndex(9); err != nil {
+		t.Fatal(err)
+	}
+	readyMessages(r)
+
+	// Lose leadership before this read is ever confirmed.
+	r.becomeFollower(r.currentTerm + 1)
+	// Regain it later (a fresh term).
+	r.becomeCandidate()
+	r.becomeLeader()
+	readyMessages(r)
+
+	// A late-arriving ack for the OLD, now-abandoned context must not
+	// resurrect it or do anything at all.
+	r.Step(Message{Type: MsgAppendEntriesResponse, To: 1, From: 2, Term: r.currentTerm, Success: true, ReadContext: 9})
+	if rd := r.Ready(); len(rd.ReadStates) != 0 {
+		t.Fatalf("ReadStates = %+v for a context from a previous, since-abandoned leadership term, want none", rd.ReadStates)
+	}
+}
+
+func TestReady_ReadStatesClearedAfterAdvance(t *testing.T) {
+	r, _ := New(Config{ID: 1, ElectionTick: 10, HeartbeatTick: 1})
+	r.becomeCandidate() // single-node: leader immediately
+	if err := r.RequestReadIndex(1); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Ready().ReadStates) != 1 {
+		t.Fatal("expected one ReadState before Advance")
+	}
+	r.Advance()
+	if len(r.Ready().ReadStates) != 0 {
+		t.Fatal("expected ReadStates to be cleared after Advance")
+	}
+}
+
 func TestRequestVoteResponse_HigherTermCausesStepDown(t *testing.T) {
 	r, _ := New(Config{ID: 1, Peers: []uint64{2, 3}, ElectionTick: 10, HeartbeatTick: 1})
 	r.becomeCandidate()

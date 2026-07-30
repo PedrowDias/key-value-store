@@ -100,6 +100,17 @@ type Ready struct {
 	// Messages are outbound messages, safe to send once the above is
 	// durable.
 	Messages []Message
+
+	// ReadStates are ReadIndex requests (see Raft.RequestReadIndex) that
+	// a majority have now confirmed. Unlike everything else in Ready,
+	// these carry no durability requirement of their own — nothing here
+	// needs to be persisted before use, since they don't represent new
+	// durable state, only a majority's confirmation of something already
+	// true. The caller should, for each one, wait until its own
+	// locally-applied state has caught up to at least Index, then serve
+	// the read it was tracking on behalf of Context with a
+	// linearizability guarantee.
+	ReadStates []ReadState
 }
 
 // tests, observability, and callers deciding where to route a proposal.
@@ -181,6 +192,16 @@ type Raft struct {
 	// pre-vote round. See becomePreCandidate's doc.
 	preVotesReceived map[uint64]bool
 
+	// Leader-only volatile state for the ReadIndex protocol (see
+	// RequestReadIndex's doc). Reset fresh on every transition into
+	// Leader, matching nextIndex/matchIndex/sentIndex's own pattern.
+	// pendingReads tracks each outstanding read confirmation request by
+	// its caller-provided context; readStates accumulates confirmed
+	// ones until the next Ready()/Advance() cycle drains them, mirroring
+	// how msgs works.
+	pendingReads map[uint64]*pendingRead
+	readStates   []ReadState
+
 	electionTick              int
 	heartbeatTick             int
 	electionElapsed           int
@@ -190,6 +211,14 @@ type Raft struct {
 	rnd *rand.Rand
 
 	msgs []Message
+}
+
+// pendingRead tracks one outstanding ReadIndex confirmation request: the
+// commitIndex as of when it was requested, and which peers (by ID) have
+// since acknowledged this leader's continued legitimacy.
+type pendingRead struct {
+	index uint64
+	acked map[uint64]bool
 }
 
 // New constructs a Raft node in the Follower role, term 0, with an empty
@@ -246,7 +275,7 @@ func (r *Raft) Status() Status {
 // contract this establishes. Safe to call repeatedly without side
 // effects; nothing is cleared until Advance().
 func (r *Raft) Ready() Ready {
-	rd := Ready{Messages: r.msgs}
+	rd := Ready{Messages: r.msgs, ReadStates: r.readStates}
 	if r.currentTerm != r.stableTerm || r.votedFor != r.stableVote {
 		rd.HardState = &HardState{Term: r.currentTerm, Vote: r.votedFor}
 	}
@@ -267,6 +296,7 @@ func (r *Raft) Advance() {
 		r.unstableIndex = r.lastLogIndex() + 1
 	}
 	r.msgs = nil
+	r.readStates = nil
 }
 
 // Entries returns the entries in (start, end] — i.e. after index start up
@@ -459,6 +489,7 @@ func (r *Raft) becomeLeader() {
 	r.nextIndex = make(map[uint64]uint64, len(r.peers))
 	r.matchIndex = make(map[uint64]uint64, len(r.peers))
 	r.sentIndex = make(map[uint64]uint64, len(r.peers))
+	r.pendingReads = make(map[uint64]*pendingRead)
 	for _, p := range r.peers {
 		r.nextIndex[p] = r.lastLogIndex() + 1
 		r.matchIndex[p] = 0
@@ -472,7 +503,7 @@ func (r *Raft) becomeLeader() {
 
 func (r *Raft) sendHeartbeats() {
 	for _, p := range r.peers {
-		r.sendAppendEntries(p)
+		r.sendAppendEntries(p, 0)
 	}
 }
 
@@ -483,7 +514,14 @@ func (r *Raft) sendHeartbeats() {
 // what makes a conflict-retry (see handleAppendEntriesResponse's failure
 // path, which explicitly resets sentIndex first) correctly restart from
 // the authoritative acknowledged point instead of a stale optimistic one.
-func (r *Raft) sendAppendEntries(peer uint64) {
+//
+// readContext, if nonzero, piggybacks a ReadIndex confirmation probe
+// onto this same message (see RequestReadIndex's doc) — reusing the
+// exact same AppendEntries a normal heartbeat or replication send would
+// produce, rather than a separate RPC, since "does this peer still ack
+// me as leader" is exactly what an ordinary AppendEntries round trip
+// already establishes.
+func (r *Raft) sendAppendEntries(peer uint64, readContext uint64) {
 	prevIndex := r.nextIndex[peer] - 1
 	if r.sentIndex[peer] > prevIndex {
 		prevIndex = r.sentIndex[peer]
@@ -497,6 +535,7 @@ func (r *Raft) sendAppendEntries(peer uint64) {
 		PrevLogTerm:  prevTerm,
 		Entries:      entries,
 		LeaderCommit: r.commitIndex,
+		ReadContext:  readContext,
 	})
 	if r.lastLogIndex() > r.sentIndex[peer] {
 		r.sentIndex[peer] = r.lastLogIndex()
@@ -610,7 +649,7 @@ func (r *Raft) handleAppendEntries(m Message) {
 	r.becomeFollower(m.Term)
 	r.leaderID = m.From
 
-	reply := Message{Type: MsgAppendEntriesResponse, To: m.From}
+	reply := Message{Type: MsgAppendEntriesResponse, To: m.From, ReadContext: m.ReadContext}
 
 	switch {
 	case m.PrevLogIndex > r.lastLogIndex():
@@ -652,6 +691,16 @@ func (r *Raft) handleAppendEntriesResponse(m Message) {
 		return
 	}
 
+	// A response at our own current term, from a leader's-eye view,
+	// means m.From still recognizes us as leader as of right now —
+	// exactly the signal a pending ReadIndex confirmation needs, whether
+	// or not the AppendEntries itself succeeded (its success or failure
+	// is about log content, orthogonal to "does this peer still ack me
+	// as leader").
+	if m.ReadContext != 0 {
+		r.ackReadIndex(m.ReadContext, m.From)
+	}
+
 	if m.Success {
 		if m.MatchIndex > r.matchIndex[m.From] {
 			r.matchIndex[m.From] = m.MatchIndex
@@ -677,7 +726,7 @@ func (r *Raft) handleAppendEntriesResponse(m Message) {
 		r.nextIndex[m.From]--
 	}
 	r.sentIndex[m.From] = 0
-	r.sendAppendEntries(m.From)
+	r.sendAppendEntries(m.From, 0)
 }
 
 // maybeAdvanceCommitIndex implements the Raft paper's §5.4.2 safety rule:
@@ -753,10 +802,76 @@ func (r *Raft) ProposeBatch(datas [][]byte) ([]uint64, error) {
 		indices[i] = entry.Index
 	}
 	for _, p := range r.peers {
-		r.sendAppendEntries(p)
+		r.sendAppendEntries(p, 0)
 	}
 	if len(r.peers) == 0 {
 		r.maybeAdvanceCommitIndex()
 	}
 	return indices, nil
+}
+
+// RequestReadIndex asks this leader to confirm, via a fresh round of
+// AppendEntries to a majority of the cluster, that it's still the
+// legitimate leader as of right now — the ReadIndex protocol (Raft
+// paper §8) that makes a linearizable read safe without routing the
+// read itself through the replicated log. The commitIndex at the
+// moment this is called is guaranteed to reflect every write that had
+// already committed before the read began; once a majority confirm
+// (reported via a ReadState in a later Ready() call — see its own doc),
+// a caller that waits for its own locally-applied state to reach at
+// least that index before actually reading its state machine is
+// guaranteed a linearizable result.
+//
+// ctx is an opaque, caller-chosen correlation ID — it must be unique
+// among this caller's own concurrently outstanding requests, since it's
+// how the eventual ReadState is matched back to the request that
+// started it. Returns ErrNotLeader if this node isn't currently
+// leader — only a leader can meaningfully answer "is my state
+// authoritative," so like Propose, a read must be routed to the leader
+// either way.
+//
+// Deliberately not optimized to coalesce multiple concurrent calls
+// arriving close together into a single shared heartbeat round (a
+// well-known real-world optimization — etcd/raft's actual
+// implementation does this). A scope decision favoring simplicity and
+// testability over the additional throughput this would give under
+// very heavy concurrent read load, documented here rather than left to
+// look like an oversight.
+func (r *Raft) RequestReadIndex(ctx uint64) error {
+	if r.role != Leader {
+		return ErrNotLeader
+	}
+	r.pendingReads[ctx] = &pendingRead{index: r.commitIndex, acked: map[uint64]bool{r.id: true}}
+	if r.hasMajorityCount(len(r.pendingReads[ctx].acked)) {
+		// Single-node cluster: a majority of one is already satisfied
+		// by our own implicit self-ack, with no peers to actually ask.
+		r.readStates = append(r.readStates, ReadState{Index: r.commitIndex, Context: ctx})
+		delete(r.pendingReads, ctx)
+		return nil
+	}
+	for _, p := range r.peers {
+		r.sendAppendEntries(p, ctx)
+	}
+	return nil
+}
+
+// ackReadIndex records that peer has, as of right now, confirmed this
+// leader's legitimacy for the pending read tracked under ctx — and, once
+// a majority (including the leader's own implicit self-ack) have,
+// reports it as a confirmed ReadState for the next Ready() call to
+// surface. A ctx not found in pendingReads is silently ignored: either
+// it was already confirmed and cleared, or it's a stale echo from a
+// round tied to a read this node no longer recognizes (e.g. a fresh
+// becomeLeader reset cleared the map since) — in neither case is there
+// anything left to do.
+func (r *Raft) ackReadIndex(ctx, peer uint64) {
+	pr, ok := r.pendingReads[ctx]
+	if !ok {
+		return
+	}
+	pr.acked[peer] = true
+	if r.hasMajorityCount(len(pr.acked)) {
+		r.readStates = append(r.readStates, ReadState{Index: pr.index, Context: ctx})
+		delete(r.pendingReads, ctx)
+	}
 }

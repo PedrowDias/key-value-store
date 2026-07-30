@@ -177,15 +177,19 @@ func TestDecodeMessage_LaterEntryHeaderStarvedBySpaceHungryEarlierEntry(t *testi
 	const headerBeforeEntries = 1 + 8*5 + 1 + 8*2 + 4
 	dataLenOffset := headerBeforeEntries + 8 + 8 // past this entry's Term, Index
 
-	// Corrupt the first entry's declared data length from 5 to 40. This
+	// Corrupt the first entry's declared data length from 5 to 49. This
 	// must (a) still pass THIS entry's own "declared length <= all
-	// remaining bytes" check — 40 is comfortably under the ~52 bytes
-	// left in the buffer at that point — while (b) consuming 35 bytes
+	// remaining bytes" check — 49 is comfortably under the ~60 bytes
+	// left in the buffer at that point — while (b) consuming 44 bytes
 	// more than the real 5, which is exactly enough to eat into the
-	// space the second entry's 20-byte header needs, without changing
-	// the buffer's total length at all.
+	// space the second entry's 20-byte header needs (leaving only 11
+	// bytes), without changing the buffer's total length at all. (49,
+	// not the smaller value that would suffice with a shorter message
+	// layout, specifically to still land below the second entry's
+	// header size even with the trailing ReadContext field's extra 8
+	// bytes of slack elsewhere in the buffer.)
 	corrupted := append([]byte(nil), valid...)
-	binary.LittleEndian.PutUint32(corrupted[dataLenOffset:], 40)
+	binary.LittleEndian.PutUint32(corrupted[dataLenOffset:], 49)
 
 	if _, err := decodeMessage(corrupted); err == nil {
 		t.Fatal("expected an error when an earlier entry's inflated data length starves a later entry's header")

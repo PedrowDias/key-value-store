@@ -123,4 +123,24 @@ type Message struct {
 	// inferring it; it's meaningless when Success is false.
 	Success    bool
 	MatchIndex uint64
+
+	// ReadContext, when nonzero, piggybacks a ReadIndex confirmation
+	// probe onto an AppendEntries request — a follower that receives one
+	// echoes it back unchanged on its AppendEntriesResponse (regardless
+	// of Success), which is how the leader confirms a majority still
+	// recognize it as leader as of right now, the safety check a
+	// linearizable read relies on. See Raft.RequestReadIndex's doc.
+	// Zero means "no read confirmation being requested," an ordinary
+	// AppendEntries or heartbeat.
+	ReadContext uint64
+}
+
+// ReadState reports that a pending ReadIndex request (see
+// Raft.RequestReadIndex) has been confirmed by a majority: once the
+// caller's own locally-applied state has caught up to at least Index,
+// it's safe to serve the read Context was requested for, with a
+// linearizability guarantee.
+type ReadState struct {
+	Index   uint64
+	Context uint64
 }

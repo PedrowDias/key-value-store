@@ -23,6 +23,7 @@ import (
 //	[8B  PrevLogIndex][8B  PrevLogTerm]
 //	[4B  entry count][entries...]
 //	[8B  LeaderCommit][1B Success][8B MatchIndex]
+//	[8B  ReadContext]
 //
 // Each entry: [8B Term][8B Index][4B data length][data].
 //
@@ -33,7 +34,7 @@ import (
 // the benchmarking phase if per-message overhead ever shows up as a
 // real cost; not worth the complexity until it does.
 const (
-	fixedFieldsSize = 1 + 8 + 8 + 8 + 8 + 8 + 1 + 8 + 8 + 4 + 8 + 1 + 8
+	fixedFieldsSize = 1 + 8 + 8 + 8 + 8 + 8 + 1 + 8 + 8 + 4 + 8 + 1 + 8 + 8
 	entryHeaderSize = 8 + 8 + 4
 )
 
@@ -73,6 +74,7 @@ func encodeMessage(m raft.Message) []byte {
 	buf[off] = boolByte(m.Success)
 	off++
 	off += putUint64(buf[off:], m.MatchIndex)
+	off += putUint64(buf[off:], m.ReadContext)
 
 	return buf
 }
@@ -134,13 +136,14 @@ func decodeMessage(data []byte) (raft.Message, error) {
 		m.Entries[i] = e
 	}
 
-	if len(data)-off < 8+1+8 {
+	if len(data)-off < 8+1+8+8 {
 		return raft.Message{}, errMalformedMessage
 	}
 	m.LeaderCommit, off = getUint64(data, off)
 	m.Success = data[off] != 0
 	off++
 	m.MatchIndex, off = getUint64(data, off)
+	m.ReadContext, off = getUint64(data, off)
 
 	return m, nil
 }

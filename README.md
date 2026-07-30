@@ -81,7 +81,7 @@ go test ./... -race -short
 | `memtable` | In-memory skip-list write buffer with snapshot-isolated iteration. |
 | `sstable` | Immutable on-disk sorted tables: block index + Bloom filter for point lookups. |
 | `engine` | Wires `wal` + `memtable` + `sstable` into `Put`/`Get`/`Delete`/`ApplyBatch`, with auto-flush and crash recovery. |
-| `raft` | Leader election with the Pre-Vote extension, log replication, crash-safe persistence (`Ready`/`Advance`), batched proposals. |
+| `raft` | Leader election with the Pre-Vote extension, log replication, crash-safe persistence (`Ready`/`Advance`), batched proposals, ReadIndex for linearizable reads. |
 | `transport` | Custom binary wire protocol over TCP connecting cluster nodes. |
 | `server` | The replicated state machine: drives one `raft.Node`, applies committed entries to one `engine.Engine`, serves the HTTP API. |
 | `cmd/kvstore` | The runnable binary: flags, wiring, graceful shutdown. |
@@ -215,14 +215,33 @@ that only showed up under conditions the previous testing hadn't
 covered, is the more interesting and more honest part of the story than
 any single number.
 
-**Reads don't go through Raft.** `Get` reads local state directly —
-fast and available even mid-election, but only eventually consistent
-(a follower, or even a leader that just lost leadership, can serve a
-stale value). True linearizable reads need a `ReadIndex` round
-(confirming current leadership before serving), which isn't implemented.
-This is what most Raft-backed stores default to for reads that don't
-need strict consistency, and it's a deliberate, documented tradeoff
-rather than an oversight.
+**Reads default to fast and local, with linearizability available as an
+opt-in.** `Get` reads local state directly — fast and available even
+mid-election, but only eventually consistent (a follower, or even a
+leader that just lost leadership, can serve a stale value). This is
+what most Raft-backed stores default to for reads that don't need
+strict consistency, and it's a deliberate, documented tradeoff rather
+than an oversight. `LinearizableGet` (HTTP: `?linearizable=true`) is
+the alternative when a caller genuinely needs the stronger guarantee:
+the ReadIndex protocol (Raft paper §8) confirms, via a fresh round of
+AppendEntries to a majority, that this node is still the legitimate
+leader as of right now, before serving the read — a real network round
+trip, paid for only when asked for. Verified end-to-end against a real
+3-node cluster (real TCP transport, real wire encoding, not just
+in-memory tests): a linearizable read against the leader returns the
+correct value, and against a follower correctly returns 503 with a
+leader hint, exactly like a write would.
+
+Two real bugs surfaced building this, both the kind unit tests alone
+wouldn't have caught: `transport`'s hand-written binary wire codec
+didn't know about the new field ReadIndex confirmation piggybacks on
+AppendEntries messages, silently dropping it over a real network
+connection even though in-memory tests (which bypass the wire format
+entirely) passed fine; and the very first read request any server ever
+handles was assigned context 0, colliding with 0's existing meaning as
+"no read context attached" at the message level, so it could never
+actually confirm. Both found via a real-cluster smoke test after the
+full unit and integration suite already passed.
 
 ## Real bugs found during development
 
@@ -285,6 +304,19 @@ of what this project actually demonstrates.
   genuinely two-sided result: a clean, large win for the isolated case
   the feature targets, and a real, honestly-documented limitation under
   heavy concurrent load — see the design section above.
+- **Two more real bugs, caught only once testing left pure unit tests
+  behind.** `LinearizableGet`'s full unit and integration suite passed
+  cleanly — including tests exercising the exact majority-ack
+  confirmation logic — before a real 3-node cluster smoke test still
+  hung on its very first linearizable read. The actual causes were both
+  below the level any in-memory test could see: `transport`'s
+  hand-written wire codec had no idea about the new field ReadIndex
+  confirmation needs, silently dropping it in transit over a real TCP
+  connection; and the very first read request any server ever handles
+  was assigned context 0, colliding with 0's pre-existing meaning as
+  "no read context attached," so it could never be told apart from an
+  ordinary message. Fixed, then reverified against the same real
+  cluster — see the design section above.
 
 ## Benchmark results
 
@@ -328,8 +360,6 @@ cluster.
 - **No log compaction / snapshotting**: the Raft log grows unboundedly;
   a new or long-partitioned node replays the whole log rather than
   installing a snapshot.
-- **No `ReadIndex`**: reads are eventually consistent, not linearizable
-  (see above).
 - **Async flush bounds itself to one flush in flight at a time**: a
   concurrent write that arrives while a flush is already running waits
   for it to finish rather than starting a second one. Simpler to reason

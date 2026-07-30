@@ -129,6 +129,94 @@ func TestHTTPAPI_GetEngineErrorReturns500(t *testing.T) {
 	}
 }
 
+// --- Linearizable reads via ?linearizable=true -------------------------------
+
+func TestHTTPAPI_LinearizableGet_RoundTrip(t *testing.T) {
+	fake := newFakeRaftNode()
+	fake.autoConfirmReadIndex = true
+	ts, _ := startFakeHTTPServer(t, fake)
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/kv/mykey", strings.NewReader("myvalue"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("PUT status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+
+	resp, err = http.Get(ts.URL + "/kv/mykey?linearizable=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("linearizable GET status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "myvalue" {
+		t.Fatalf("body = %q, want myvalue", body)
+	}
+}
+
+func TestHTTPAPI_LinearizableGet_NotFound(t *testing.T) {
+	fake := newFakeRaftNode()
+	fake.autoConfirmReadIndex = true
+	ts, _ := startFakeHTTPServer(t, fake)
+
+	resp, err := http.Get(ts.URL + "/kv/never-existed?linearizable=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+}
+
+func TestHTTPAPI_LinearizableGet_NotLeaderReturns503WithLeaderHint(t *testing.T) {
+	fake := newFakeRaftNode()
+	fake.readIndexErr = raft.ErrNotLeader
+	fake.status.Leader = 7
+	ts, _ := startFakeHTTPServer(t, fake)
+
+	resp, err := http.Get(ts.URL + "/kv/k?linearizable=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
+	}
+	if got := resp.Header.Get("X-Raft-Leader-Id"); got != "7" {
+		t.Fatalf("X-Raft-Leader-Id = %q, want 7", got)
+	}
+}
+
+func TestHTTPAPI_Get_WithoutLinearizableParamUsesLocalReadNotReadIndex(t *testing.T) {
+	// autoConfirmReadIndex deliberately left false: if a plain GET (no
+	// query param) ever took the LinearizableGet path, this would hang
+	// until proposeTimeout and fail as a 500/504, not succeed — passing
+	// here is itself the proof the default path is unaffected by
+	// LinearizableGet's addition.
+	fake := newFakeRaftNode()
+	ts, _ := startFakeHTTPServer(t, fake)
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/kv/k", strings.NewReader("v"))
+	resp, _ := http.DefaultClient.Do(req)
+	resp.Body.Close()
+
+	resp, err := http.Get(ts.URL + "/kv/k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+}
+
 func TestHTTPAPI_PutNotLeaderReturns503WithLeaderHint(t *testing.T) {
 	fake := newFakeRaftNode()
 	fake.proposeErr = raft.ErrNotLeader

@@ -31,6 +31,19 @@ type fakeRaftNode struct {
 	// tests that manipulate status/entries directly (bypassing the real
 	// Propose flow) are unaffected.
 	autoCommit bool
+
+	// readIndexErr, if set, is what RequestReadIndex returns instead of
+	// succeeding — e.g. to simulate calling it on a non-leader.
+	readIndexErr error
+	// autoConfirmReadIndex mirrors autoCommit's role, but for
+	// RequestReadIndex: if true, a call immediately queues a ReadState
+	// (as of the current status.CommitIndex) to be returned by the very
+	// next Persist() call, simulating instant confirmation — the actual
+	// majority-of-acks confirmation mechanics are already exhaustively
+	// tested against the real raft.Raft in the raft package itself; this
+	// fake only needs to exercise Server's OWN plumbing around it.
+	autoConfirmReadIndex bool
+	pendingReadStates    []raft.ReadState
 }
 
 func newFakeRaftNode() *fakeRaftNode {
@@ -87,11 +100,27 @@ func (f *fakeRaftNode) Entries(start, end uint64) []raft.LogEntry {
 	return out
 }
 
-func (f *fakeRaftNode) Persist() ([]raft.Message, error) {
-	if f.persistErr != nil {
-		return nil, f.persistErr
+// RequestReadIndex mirrors real leadership-gating (an error when this
+// isn't the leader is the one behavior tests actually rely on); see
+// autoConfirmReadIndex's own doc for how confirmation itself is
+// simulated.
+func (f *fakeRaftNode) RequestReadIndex(ctx uint64) error {
+	if f.readIndexErr != nil {
+		return f.readIndexErr
 	}
-	return f.persistMsgs, nil
+	if f.autoConfirmReadIndex {
+		f.pendingReadStates = append(f.pendingReadStates, raft.ReadState{Index: f.status.CommitIndex, Context: ctx})
+	}
+	return nil
+}
+
+func (f *fakeRaftNode) Persist() ([]raft.Message, []raft.ReadState, error) {
+	if f.persistErr != nil {
+		return nil, nil, f.persistErr
+	}
+	rs := f.pendingReadStates
+	f.pendingReadStates = nil
+	return f.persistMsgs, rs, nil
 }
 
 func newTestEngine(t *testing.T) *engine.Engine {
@@ -472,6 +501,75 @@ func TestPropose_StoppedWhileWaitingForResult(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("propose did not return after doneCh closed")
+	}
+}
+
+// --- LinearizableGet's shutdown branches (mirroring propose's own) ---------
+
+func TestLinearizableGet_StoppedBeforeSubmission(t *testing.T) {
+	// Constructed directly (bypassing New()) with an UNBUFFERED
+	// readIndexCh specifically — see TestPropose_StoppedBeforeSubmission's
+	// own comment for why an unbuffered channel is what actually
+	// exercises this branch rather than masking it.
+	srv := &Server{
+		node:               newFakeRaftNode(),
+		tr:                 newTestTransport(t),
+		eng:                newTestEngine(t),
+		readIndexCh:        make(chan readIndexRequest),
+		stopCh:             make(chan struct{}),
+		doneCh:             make(chan struct{}),
+		pendingReadIndexes: make(map[uint64]readIndexRequest),
+	}
+	close(srv.doneCh) // simulate Run having already exited
+
+	_, _, err := srv.LinearizableGet([]byte("k"))
+	if err == nil {
+		t.Fatal("expected an error calling LinearizableGet after the server has stopped")
+	}
+}
+
+func TestLinearizableGet_StoppedWhileWaitingForResult(t *testing.T) {
+	srv := New(newFakeRaftNode(), newTestTransport(t), newTestEngine(t), time.Hour)
+
+	// Absorb exactly one request from readIndexCh (simulating Run having
+	// picked it up) but never respond, then close doneCh directly to
+	// simulate the server stopping after submission but before a result
+	// arrives.
+	go func() { <-srv.readIndexCh }()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, _, err := srv.LinearizableGet([]byte("k"))
+		errCh <- err
+	}()
+
+	time.Sleep(50 * time.Millisecond) // give it time to reach the second select
+	close(srv.doneCh)
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected an error when doneCh closes while waiting for a read-index result")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("LinearizableGet did not return after doneCh closed")
+	}
+}
+
+// --- pump()'s unrecognized-read-context branch ------------------------------
+
+func TestPump_ReadStateWithUnrecognizedContextIsIgnored(t *testing.T) {
+	fake := newFakeRaftNode()
+	// A ReadState the server never actually requested — e.g. a stale
+	// round from before a restart, or simply a context this Server
+	// instance never assigned. Must be a harmless no-op, not a panic
+	// from an unchecked map access.
+	fake.pendingReadStates = []raft.ReadState{{Index: 5, Context: 999}}
+
+	srv := New(fake, newTestTransport(t), newTestEngine(t), time.Hour)
+	srv.pump() // must not panic
+	if len(srv.pendingReadIndexes) != 0 {
+		t.Fatalf("pendingReadIndexes = %v, want empty (nothing was ever registered under context 999)", srv.pendingReadIndexes)
 	}
 }
 

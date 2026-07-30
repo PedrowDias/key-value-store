@@ -57,9 +57,10 @@ type raftNode interface {
 	Step(m raft.Message)
 	Propose(data []byte) error
 	ProposeBatch(datas [][]byte) ([]uint64, error)
+	RequestReadIndex(ctx uint64) error
 	Status() raft.Status
 	Entries(start, end uint64) []raft.LogEntry
-	Persist() ([]raft.Message, error)
+	Persist() ([]raft.Message, []raft.ReadState, error)
 }
 
 // Server runs one node's full participation in the cluster: driving its
@@ -100,15 +101,30 @@ type Server struct {
 	batchWindow  time.Duration
 	maxBatchSize int
 
-	proposeCh chan proposeRequest
-	stopCh    chan struct{}
-	stopOnce  sync.Once
-	doneCh    chan struct{}
+	proposeCh   chan proposeRequest
+	readIndexCh chan readIndexRequest
+	stopCh      chan struct{}
+	stopOnce    sync.Once
+	doneCh      chan struct{}
 
 	// Owned exclusively by the Run goroutine; never touched from any
 	// other goroutine.
 	lastApplied uint64
 	waiters     map[uint64]pendingPropose
+
+	// pendingReadIndexes and nextReadCtx are also Run-goroutine-only —
+	// see LinearizableGet's doc for the full protocol. nextReadCtx is a
+	// simple incrementing counter rather than anything fancier, since
+	// Run is the only goroutine that ever assigns one, making a data
+	// race on it structurally impossible. Starts at 1, not 0: context 0
+	// is reserved to mean "no read context attached" at the message
+	// level (Message.ReadContext's own doc) — matching this project's
+	// existing convention of reserving 0 as a sentinel for uint64 IDs
+	// (votedFor, leaderID) — so a real request must never be assigned
+	// context 0, or its confirmation would be indistinguishable from an
+	// ordinary, unrelated message and silently never counted.
+	pendingReadIndexes map[uint64]readIndexRequest
+	nextReadCtx        uint64
 
 	// cachedStatus mirrors the underlying raft.Node's status so Status()
 	// can be called safely from any goroutine. This matters because
@@ -121,6 +137,19 @@ type Server struct {
 	// result here under statusMu for everyone else to read.
 	statusMu     sync.RWMutex
 	cachedStatus raft.Status
+}
+
+// readIndexRequest is what LinearizableGet hands to Run() via a channel,
+// mirroring proposeRequest's own pattern: the actual raft.Node call
+// (RequestReadIndex) must happen on Run's single goroutine, since
+// raft.Node is not safe for concurrent use.
+type readIndexRequest struct {
+	resultCh chan readIndexResult
+}
+
+type readIndexResult struct {
+	index uint64
+	err   error
 }
 
 // proposeChBufferSize bounds how many pending Put/Delete calls can be
@@ -144,17 +173,20 @@ const (
 // calling Server.Stop()).
 func New(node raftNode, tr *transport.Transport, eng *engine.Engine, tickInterval time.Duration) *Server {
 	return &Server{
-		node:         node,
-		tr:           tr,
-		eng:          eng,
-		tickInterval: tickInterval,
-		batchWindow:  defaultBatchWindow,
-		maxBatchSize: defaultMaxBatchSize,
-		proposeCh:    make(chan proposeRequest, proposeChBufferSize),
-		stopCh:       make(chan struct{}),
-		doneCh:       make(chan struct{}),
-		waiters:      make(map[uint64]pendingPropose),
-		cachedStatus: node.Status(),
+		node:               node,
+		tr:                 tr,
+		eng:                eng,
+		tickInterval:       tickInterval,
+		batchWindow:        defaultBatchWindow,
+		maxBatchSize:       defaultMaxBatchSize,
+		proposeCh:          make(chan proposeRequest, proposeChBufferSize),
+		readIndexCh:        make(chan readIndexRequest, proposeChBufferSize),
+		stopCh:             make(chan struct{}),
+		doneCh:             make(chan struct{}),
+		waiters:            make(map[uint64]pendingPropose),
+		pendingReadIndexes: make(map[uint64]readIndexRequest),
+		nextReadCtx:        1,
+		cachedStatus:       node.Status(),
 	}
 }
 
@@ -226,6 +258,16 @@ func (s *Server) Run() {
 				batchTimerC = batchTimer.C
 			}
 
+		case req := <-s.readIndexCh:
+			ctx := s.nextReadCtx
+			s.nextReadCtx++
+			if err := s.node.RequestReadIndex(ctx); err != nil {
+				req.resultCh <- readIndexResult{err: err}
+				break
+			}
+			s.pendingReadIndexes[ctx] = req
+			s.pump()
+
 		case <-batchTimerC:
 			batchTimerC = nil
 			s.submitBatch(pending)
@@ -233,6 +275,7 @@ func (s *Server) Run() {
 
 		case <-s.stopCh:
 			s.failPending(pending, fmt.Errorf("server: stopped"))
+			s.failPendingReadIndexes(fmt.Errorf("server: stopped"))
 			return
 		}
 	}
@@ -280,6 +323,16 @@ func (s *Server) failPending(pending []proposeRequest, err error) {
 	}
 }
 
+// failPendingReadIndexes notifies every outstanding LinearizableGet
+// request that will now never be confirmed (the server is stopping) and
+// clears the map — mirroring failPending's role for write proposals.
+func (s *Server) failPendingReadIndexes(err error) {
+	for ctx, req := range s.pendingReadIndexes {
+		req.resultCh <- readIndexResult{err: err}
+		delete(s.pendingReadIndexes, ctx)
+	}
+}
+
 // Stop signals Run to exit and waits for it to actually do so. Safe to
 // call more than once, and safe to call even if Run was never started.
 func (s *Server) Stop() {
@@ -293,7 +346,7 @@ func (s *Server) Stop() {
 // Step, and Propose, which is the discipline raft.Node's documentation
 // requires.
 func (s *Server) pump() {
-	msgs, err := s.node.Persist()
+	msgs, readStates, err := s.node.Persist()
 	if err != nil {
 		// A persist failure means this node can no longer safely
 		// participate (its durability guarantees are broken) — there's
@@ -313,6 +366,29 @@ func (s *Server) pump() {
 		s.tr.Send(m)
 	}
 	s.applyCommitted()
+
+	// Resolve any ReadIndex requests a majority just confirmed. The
+	// ReadIndex protocol's other half — waiting for this node's own
+	// locally-applied state to catch up to the confirmed index before
+	// it's actually safe to read — needs no separate step here: a
+	// ReadState's Index is always <= the commitIndex it was confirmed
+	// against, which is itself <= this call's CURRENT commitIndex (it
+	// only grows), and applyCommitted just unconditionally caught this
+	// node up to that current commitIndex. So by construction,
+	// s.lastApplied >= rs.Index always holds by the time we get here —
+	// a property specific to this project's single-threaded,
+	// apply-every-pump-call architecture, not something a more general
+	// implementation (e.g. applying on a separate goroutine) could
+	// assume for free.
+	for _, rs := range readStates {
+		req, ok := s.pendingReadIndexes[rs.Context]
+		if !ok {
+			continue // already resolved some other way, or unrecognized
+		}
+		delete(s.pendingReadIndexes, rs.Context)
+		req.resultCh <- readIndexResult{index: rs.Index}
+	}
+
 	s.refreshCachedStatus()
 }
 
@@ -483,15 +559,55 @@ func (s *Server) Delete(key []byte) error {
 // possibly stale on a follower, and possibly stale even on a leader that
 // has just lost leadership without yet realizing it (a "stale leader"
 // serving a read while a new leader has already committed newer writes
-// elsewhere). Real linearizable reads need an additional mechanism (a
-// "ReadIndex" round confirming current leadership before serving the
-// read, described in the Raft paper's extended thesis) — a reasonable
-// thing to add later if a client actually needs read-your-writes or
-// linearizability guarantees; until then, this is eventually-consistent
-// read-from-local-state, which is what most Raft-backed KV stores
-// default to for reads that don't need to go through the leader.
+// elsewhere). This is eventually-consistent read-from-local-state,
+// which is what most Raft-backed KV stores default to for reads that
+// don't need to go through the leader; LinearizableGet is the opt-in
+// alternative when a caller genuinely needs a stronger guarantee.
 func (s *Server) Get(key []byte) ([]byte, bool, error) {
 	return s.eng.Get(key)
+}
+
+// LinearizableGet reads key with a linearizability guarantee: the
+// result is guaranteed to reflect every write that had already
+// committed before this call began — never a stale value, unlike Get.
+// It does this via the ReadIndex protocol (Raft paper §8,
+// raft.Raft.RequestReadIndex): confirm, through a fresh round of
+// AppendEntries to a majority, that this node is still the legitimate
+// leader as of right now, then read local state once it's caught up to
+// that confirmed point.
+//
+// This only works when called against the current leader — like
+// Put/Delete, it returns raft.ErrNotLeader (wrapped) otherwise, and the
+// caller is expected to redirect to whichever node it believes is
+// leader. Costs a real network round trip to a majority of the
+// cluster, unlike Get's purely-local read — pay for it only when the
+// guarantee actually matters to the caller.
+func (s *Server) LinearizableGet(key []byte) ([]byte, bool, error) {
+	resultCh := make(chan readIndexResult, 1)
+	select {
+	case s.readIndexCh <- readIndexRequest{resultCh: resultCh}:
+	case <-s.doneCh:
+		return nil, false, fmt.Errorf("server: stopped")
+	}
+
+	select {
+	case res := <-resultCh:
+		if res.err != nil {
+			return nil, false, res.err
+		}
+		// The read is confirmed as of res.index; local state is
+		// already guaranteed caught up to at least that point (see
+		// pump's doc for why no separate wait is needed here). Reading
+		// current state now — possibly even fresher than res.index, if
+		// more has committed and applied in the meantime — is still a
+		// valid linearizable result: reflecting more than strictly
+		// necessary is fine, only reflecting less would be a violation.
+		return s.Get(key)
+	case <-time.After(proposeTimeout):
+		return nil, false, fmt.Errorf("server: linearizable read timed out waiting for read-index confirmation")
+	case <-s.doneCh:
+		return nil, false, fmt.Errorf("server: stopped")
+	}
 }
 
 // Status returns a snapshot of the underlying Raft node's status (role,

@@ -45,6 +45,15 @@ func (n *Node) Propose(data []byte) error { return n.r.Propose(data) }
 // convenience.
 func (n *Node) ProposeBatch(datas [][]byte) ([]uint64, error) { return n.r.ProposeBatch(datas) }
 
+// RequestReadIndex asks this node (must currently be leader) to confirm
+// its continued legitimacy via a fresh round of AppendEntries to a
+// majority, the safety check a linearizable read relies on. See
+// Raft.RequestReadIndex's own doc for the full protocol and ctx's
+// meaning. Confirmation is reported asynchronously, like everything
+// else in this package: watch for a matching ReadState in a later
+// Persist() call's return.
+func (n *Node) RequestReadIndex(ctx uint64) error { return n.r.RequestReadIndex(ctx) }
+
 // Status returns a snapshot of the node's current state.
 func (n *Node) Status() Status { return n.r.Status() }
 
@@ -53,23 +62,27 @@ func (n *Node) Entries(start, end uint64) []LogEntry { return n.r.Entries(start,
 
 // Persist durably saves whatever changed since the last Persist() call
 // (HardState and/or new log entries) and returns the messages that are
-// now safe to send. Call this exactly once after each Tick(), Step(), or
-// Propose() call, before doing anything else with the node — this is
-// what upholds Raft's persist-before-send safety requirement.
-func (n *Node) Persist() ([]Message, error) {
+// now safe to send, along with any ReadIndex requests a majority have
+// now confirmed (see RequestReadIndex's doc — these carry no durability
+// requirement of their own, unlike HardState/entries, since they
+// represent a majority's confirmation of something already true rather
+// than new durable state). Call this exactly once after each Tick(),
+// Step(), or Propose() call, before doing anything else with the node —
+// this is what upholds Raft's persist-before-send safety requirement.
+func (n *Node) Persist() ([]Message, []ReadState, error) {
 	rd := n.r.Ready()
 	if rd.HardState != nil {
 		if err := n.storage.SaveHardState(*rd.HardState); err != nil {
-			return nil, fmt.Errorf("raft: node persist: %w", err)
+			return nil, nil, fmt.Errorf("raft: node persist: %w", err)
 		}
 	}
 	if len(rd.UnstableEntries) > 0 {
 		if err := n.storage.SaveEntries(rd.FirstUnstableIndex, rd.UnstableEntries); err != nil {
-			return nil, fmt.Errorf("raft: node persist: %w", err)
+			return nil, nil, fmt.Errorf("raft: node persist: %w", err)
 		}
 	}
 	n.r.Advance()
-	return rd.Messages, nil
+	return rd.Messages, rd.ReadStates, nil
 }
 
 // Close closes the node's underlying storage.

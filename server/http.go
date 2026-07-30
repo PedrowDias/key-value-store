@@ -48,7 +48,7 @@ func (a *HTTPAPI) handleKV(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		a.handleGet(w, key)
+		a.handleGet(w, r, key)
 	case http.MethodPut:
 		a.handlePut(w, r, key)
 	case http.MethodDelete:
@@ -59,10 +59,24 @@ func (a *HTTPAPI) handleKV(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (a *HTTPAPI) handleGet(w http.ResponseWriter, key string) {
-	val, found, err := a.srv.Get([]byte(key))
+// handleGet serves GET /kv/{key}. By default, reads local state directly
+// (Server.Get) — fast and always available, but only eventually
+// consistent (see Get's own doc). ?linearizable=true opts into
+// Server.LinearizableGet instead: a real network round trip to confirm
+// current leadership first, guaranteeing the result reflects every write
+// already committed before the read began. Pay for that guarantee only
+// when the caller actually asks for it.
+func (a *HTTPAPI) handleGet(w http.ResponseWriter, r *http.Request, key string) {
+	var val []byte
+	var found bool
+	var err error
+	if r.URL.Query().Get("linearizable") == "true" {
+		val, found, err = a.srv.LinearizableGet([]byte(key))
+	} else {
+		val, found, err = a.srv.Get([]byte(key))
+	}
 	if err != nil {
-		http.Error(w, fmt.Sprintf("get: %v", err), http.StatusInternalServerError)
+		a.writeRaftError(w, err)
 		return
 	}
 	if !found {
@@ -80,7 +94,7 @@ func (a *HTTPAPI) handlePut(w http.ResponseWriter, r *http.Request, key string) 
 		return
 	}
 	if err := a.srv.Put([]byte(key), value); err != nil {
-		a.writeProposeError(w, err)
+		a.writeRaftError(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -88,17 +102,18 @@ func (a *HTTPAPI) handlePut(w http.ResponseWriter, r *http.Request, key string) 
 
 func (a *HTTPAPI) handleDelete(w http.ResponseWriter, key string) {
 	if err := a.srv.Delete([]byte(key)); err != nil {
-		a.writeProposeError(w, err)
+		a.writeRaftError(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// writeProposeError classifies a Put/Delete error into an appropriate
-// HTTP status: 503 (with a leader hint header, if known) for "you asked
-// the wrong node," 504 for "this took too long to commit," 500
-// otherwise.
-func (a *HTTPAPI) writeProposeError(w http.ResponseWriter, err error) {
+// writeRaftError classifies an error from any call that needed to reach
+// the leader or a majority of the cluster — Put, Delete, or
+// LinearizableGet alike — into an appropriate HTTP status: 503 (with a
+// leader hint header, if known) for "you asked the wrong node," 504 for
+// "this took too long to commit or confirm," 500 otherwise.
+func (a *HTTPAPI) writeRaftError(w http.ResponseWriter, err error) {
 	if errors.Is(err, raft.ErrNotLeader) {
 		if leader := a.srv.Status().Leader; leader != 0 {
 			w.Header().Set("X-Raft-Leader-Id", fmt.Sprintf("%d", leader))
