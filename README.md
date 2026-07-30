@@ -179,7 +179,12 @@ partition (a comment explicitly noting this was a known, undesirable
 vanilla-Raft characteristic); with Pre-Vote, the same scenario now
 asserts the *same* leader survives with *zero* disruption, converging
 in 5 ticks — passing reliably across 30 repeated runs with different
-random seeds.
+random seeds. Quantified again separately with real wall-clock pacing
+(not the instant simulated ticks a pure correctness test uses): across
+5 trials, an isolated-but-still-ticking follower's own term never
+inflated at all (delta of exactly 0 every time) despite real time
+passing through several full election-timeout cycles while cut off —
+see [`bench/BENCHMARKS.md`](bench/BENCHMARKS.md) for the full numbers.
 
 **Group commit took four rounds to actually get right, and the last two
 found real bugs — one in the benchmark tool, one genuinely in `raft`
@@ -230,7 +235,15 @@ trip, paid for only when asked for. Verified end-to-end against a real
 3-node cluster (real TCP transport, real wire encoding, not just
 in-memory tests): a linearizable read against the leader returns the
 correct value, and against a follower correctly returns 503 with a
-leader hint, exactly like a write would.
+leader hint, exactly like a write would. That real network round trip
+is a real cost, confirmed on M3 hardware: roughly 600x slower than a
+plain `Get` for a single caller (~119ns vs ~71µs), though the gap
+narrows sharply under concurrent load (~194ns vs ~43µs, roughly 220x) —
+multiple concurrent `LinearizableGet` callers can share overlapping
+ReadIndex round trips the same way normal replication already batches
+concurrent proposals, so the marginal cost per additional concurrent
+reader is far smaller than the single-caller ratio would suggest. See
+[`bench/BENCHMARKS.md`](bench/BENCHMARKS.md) for the full numbers.
 
 Two real bugs surfaced building this, both the kind unit tests alone
 wouldn't have caught: `transport`'s hand-written binary wire codec

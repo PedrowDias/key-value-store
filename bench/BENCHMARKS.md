@@ -655,6 +655,90 @@ multi-gigabyte dataset would take measurably longer to *build* the
 snapshot it sends, on top of whatever this table shows for receiving and
 installing it.
 
+## Pre-Vote: quantified disruption avoidance
+
+Measured via:
+
+```bash
+go test ./raft/... -run TestPreVoteAvoidsDisruption -v
+```
+
+This is a different kind of measurement than the real-cluster numbers
+elsewhere in this document: it reuses `raft`'s own deterministic,
+in-memory simulated cluster (no real TCP, no separate processes) but
+paces it with real `time.Sleep` calls between ticks instead of the
+instant, purely-logical ticking that harness's own correctness tests
+use — a genuine wall-clock measurement, just not a "real network"
+one. 5 trials, isolating a follower and letting real time pass through
+several full election-timeout cycles before healing it:
+
+| | Result |
+|---|---|
+| Isolated node's term delta while cut off (all 5 trials) | **0** |
+| Reconvergence time after healing — min | 4.5 µs |
+| Reconvergence time after healing — mean | 7.7 µs |
+| Reconvergence time after healing — max | 17 µs |
+
+The term delta of exactly 0, every trial, is the number that matters:
+despite real time passing through multiple full election-timeout
+cycles while genuinely cut off from the rest of the cluster — exactly
+the scenario that, without Pre-Vote, would otherwise have this node's
+term climb higher with each failed candidacy attempt — it never
+increments at all, because Pre-Vote never lets a node become a real
+Candidate (the only thing that increments `currentTerm`) without
+already having a majority's pre-vote grant, something an isolated node
+can structurally never obtain. The existing leader's identity and term
+were also confirmed unchanged throughout every trial, both during
+isolation and immediately after healing.
+
+The reconvergence-time numbers are a simulated-cluster artifact worth
+being honest about rather than over-reading: they're measuring "how
+long until this test's polling loop notices the healed node's state
+caught up," which resolves within a single simulated tick's fully
+synchronous message exchange — there's no real network latency in this
+harness to observe. The real-world equivalent — how fast a genuinely
+network-partitioned node reconverges once reachable again — would be
+closer to one real round-trip time, not microseconds; this number
+confirms the *mechanism* converges essentially immediately once
+healed, not a real-network timing claim.
+
+## Get vs LinearizableGet: the real cost of a ReadIndex round trip
+
+Measured via:
+
+```bash
+go test ./bench/... -bench=BenchmarkGet_Vs_LinearizableGet -benchmem -benchtime=200x -run=^$ -count=3
+```
+
+Against a real 3-node cluster (real TCP transport, real `server.Server`
+instances), reading the same key repeatedly against the leader, 3 runs
+each:
+
+| | Get | LinearizableGet | Ratio |
+|---|---|---|---|
+| Single caller | ~119 ns/op | ~46,700-89,100 ns/op | **~600x** |
+| Concurrent (`b.RunParallel`) | ~194 ns/op | ~35,200-49,800 ns/op | **~220x** |
+
+`Get`'s cost is what it should be — a direct in-memory read with zero
+allocations. `LinearizableGet`'s real network round trip (a fresh
+AppendEntries confirmation to a majority before answering — see the
+design section above) is a genuine, three-orders-of-magnitude cost by
+comparison, which is exactly why this project defaults reads to the
+fast, eventually-consistent path and makes linearizability an explicit
+opt-in rather than the default.
+
+The concurrent numbers are the more interesting result: the ratio
+drops from ~600x to ~220x under concurrent load, not because
+`LinearizableGet` got cheaper in absolute terms, but because multiple
+concurrent callers' ReadIndex confirmation rounds can overlap on the
+wire — the same AppendEntries pipelining this project's group-commit
+work already relies on for writes benefits concurrent linearizable
+reads too, without any code written specifically for that. The
+individual `LinearizableGet` numbers themselves show real run-to-run
+variance (a fresh cluster, fresh TCP connections, and a fresh election
+for every repetition) — reported as the range actually observed across
+3 runs rather than a single misleadingly precise figure.
+
 ## Reproducing these results
 
 ```bash
@@ -662,4 +746,6 @@ go test ./bench/... -run TestClusterThroughputAndLatency -v
 go test ./bench/... -run TestBatchWindowSweep -v
 go test ./bench/... -bench=BenchmarkSnapshotCreation -benchmem -run=^$
 go test ./bench/... -run TestSnapshotCatchUpTime -v
+go test ./raft/... -run TestPreVoteAvoidsDisruption -v
+go test ./bench/... -bench=BenchmarkGet_Vs_LinearizableGet -benchmem -run=^$
 ```
